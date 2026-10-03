@@ -39,6 +39,8 @@ fn gfxstream() -> PkgConfigResult<()> {
     }
     gfxstream_path_env_override = gfxstream_path_env_override.filter(|s| !s.is_empty());
 
+    println!("cargo:rustc-cfg=gfxstream_unstable");
+
     if let Some(gfxstream_path) = gfxstream_path_env_override {
         println!("cargo:rustc-link-lib=gfxstream_backend");
         println!("cargo:rustc-link-search={gfxstream_path}");
