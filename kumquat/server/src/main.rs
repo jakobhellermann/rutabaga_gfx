@@ -51,6 +51,13 @@ struct Args {
 fn main() -> KumquatGpuResult<()> {
     let args = Args::parse();
 
+    // gfxstream's Vulkan snapshot capture (VkReconstruction: handles, queues,
+    // call log) is default-off and read at renderer init — without it the
+    // snapshot carries no Vulkan state and post-restore submits crash the
+    // decoder ("Failed to unbox VkQueue").
+    // SAFETY: single-threaded startup, no other threads read the environment.
+    unsafe { std::env::set_var("ANDROID_GFXSTREAM_CAPTURE_VK_SNAPSHOT", "1") };
+
     unsafe {
         libc::signal(libc::SIGUSR1, on_sigusr1 as *const () as usize);
         libc::signal(libc::SIGUSR2, on_sigusr2 as *const () as usize);

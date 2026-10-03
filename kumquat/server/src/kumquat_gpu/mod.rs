@@ -116,6 +116,9 @@ struct GuestBlobBacking {
     iovecs: Vec<RutabagaIovec>,
     guest_handle: MagmaGpuHandle,
     response_handle: MagmaGpuHandle,
+    /// Dup of the dma-buf, kept so the descriptor can be re-registered after
+    /// a snapshot restore (the original is consumed by the first mapping).
+    dma_buf_dup: OwnedDescriptor,
 }
 
 /// Creates the backing for a `BLOB_MEM_GUEST` + `CREATE_GUEST_HANDLE` blob.
@@ -149,6 +152,7 @@ fn create_guest_blob_backing(size: u64) -> Result<GuestBlobBacking, MagmaGpuErro
         descriptor.as_raw_descriptor() as u32,
         size,
     )?;
+    let dma_buf_dup = dma_buf.try_clone()?;
 
     let clone = descriptor.try_clone()?;
     let mapping = MemoryMapping::from_safe_descriptor(
@@ -183,6 +187,7 @@ fn create_guest_blob_backing(size: u64) -> Result<GuestBlobBacking, MagmaGpuErro
         iovecs,
         guest_handle: handle,
         response_handle,
+        dma_buf_dup,
     })
 }
 
@@ -222,6 +227,10 @@ struct ExportedBlob {
     blob_id: u32,
     size: u64,
     descriptor: OwnedDescriptor,
+    /// Dup of the dma-buf handed to gfxstream for the host-side import
+    /// (GUEST guest-handle blobs only). Re-registered before a restore so the
+    /// replayed vkAllocateMemory can import it again.
+    dma_buf: Option<OwnedDescriptor>,
     /// Mapping of `descriptor`, created at re-attach time and kept alive for
     /// as long as the gfxstream resource uses the address.
     mapping: Option<MemoryMapping>,
@@ -603,19 +612,21 @@ impl KumquatGpuConnection {
                         None
                     };
 
-                    let (iovecs, handle, response_handle, mapping) = match backing {
+                    let (iovecs, handle, response_handle, mapping, dma_buf_dup) = match backing {
                         Some(GuestBlobBacking {
                             mapping,
                             iovecs,
                             guest_handle,
                             response_handle,
+                            dma_buf_dup,
                         }) => (
                             Some(iovecs),
                             Some(RutabagaHandle::from(guest_handle)),
                             Some(response_handle),
                             Some(mapping),
+                            Some(dma_buf_dup),
                         ),
-                        None => (None, None, None, None),
+                        None => (None, None, None, None, None),
                     };
 
                     kumquat_gpu.rutabaga.resource_create_blob(
@@ -649,6 +660,7 @@ impl KumquatGpuConnection {
                             blob_id: cmd.blob_id as u32,
                             size: cmd.size as u64,
                             descriptor,
+                            dma_buf: dma_buf_dup,
                             mapping: None,
                         }),
                         None => None,
@@ -747,6 +759,17 @@ impl KumquatGpu {
             let Some(exported) = &mut res.exported else {
                 continue;
             };
+            // Re-register the dma-buf descriptor first: the replayed
+            // vkAllocateMemory imports it into the restored VkDeviceMemory.
+            if let Some(dma_buf) = exported.dma_buf.take() {
+                use magma_gpu::util::IntoRawDescriptor;
+                rutabaga_gfx::reattach_blob_descriptor(
+                    exported.ctx_id,
+                    exported.blob_id as u64,
+                    dma_buf.into_raw_descriptor(),
+                    MAGMA_GPU_HANDLE_TYPE_MEM_DMABUF,
+                );
+            }
             if exported.mapping.is_some() {
                 continue;
             }
@@ -764,7 +787,6 @@ impl KumquatGpu {
                         "kumquat: reattach resource {resource_id} ctx {} blob {} at {:#x}",
                         exported.ctx_id, exported.blob_id, raw.ptr
                     );
-                    #[cfg(feature = "gfxstream")]
                     rutabaga_gfx::reattach_blob_mapping(
                         exported.ctx_id,
                         exported.blob_id,
