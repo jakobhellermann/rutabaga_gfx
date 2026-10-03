@@ -148,6 +148,17 @@ pub struct stream_renderer_import_data {
     pub info_vulkan: stream_renderer_vulkan_info,
 }
 
+/// Re-attaches a VMM-owned mapping for a blob resource, to be consumed by the
+/// resource's (re)creation. Used on restore to hand gfxstream the live
+/// transport memory (e.g. the ASG ring the client keeps mapping) instead of
+/// letting the restored resource allocate fresh memory the client cannot see.
+/// The caller keeps `addr` alive for as long as the resource uses it.
+pub fn reattach_blob_mapping(ctx_id: u32, blob_id: u32, addr: *mut c_void, caching: u32) {
+    // SAFETY: addr is a valid caller-owned mapping; the C function only
+    // registers the pointer in the external object manager.
+    unsafe { stream_renderer_reattach_blob_mapping(ctx_id, blob_id, addr, caching) };
+}
+
 extern "C" {
     // Entry point for the stream renderer.
     fn stream_renderer_init(
@@ -224,6 +235,12 @@ extern "C" {
     ) -> c_int;
 
     fn stream_renderer_export_blob(res_handle: u32, handle: *mut stream_renderer_handle) -> c_int;
+    fn stream_renderer_reattach_blob_mapping(
+        ctx_id: u32,
+        blob_id: u32,
+        addr: *mut c_void,
+        caching: u32,
+    );
     fn stream_renderer_resource_map(
         res_handle: u32,
         map: *mut *mut c_void,

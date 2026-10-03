@@ -17,9 +17,9 @@ use magma_gpu::protocols::kumquat_gpu_protocol::*;
 use magma_gpu::util::create_event_pair;
 use magma_gpu::util::AsBorrowedDescriptor;
 use magma_gpu::util::AsRawDescriptor;
-use magma_gpu::util::FromRawDescriptor;
 use magma_gpu::util::Error as MagmaGpuError;
 use magma_gpu::util::EventSignaler;
+use magma_gpu::util::FromRawDescriptor;
 use magma_gpu::util::Handle as MagmaGpuHandle;
 use magma_gpu::util::MemoryMapping;
 use magma_gpu::util::OwnedDescriptor;
@@ -38,10 +38,10 @@ use rutabaga_gfx::RutabagaFence;
 use rutabaga_gfx::RutabagaFenceHandler;
 use rutabaga_gfx::RutabagaHandle;
 use rutabaga_gfx::RutabagaIovec;
-use rutabaga_gfx::RUTABAGA_BLOB_MEM_GUEST;
 use rutabaga_gfx::RutabagaWsi;
 use rutabaga_gfx::Transfer3D;
 use rutabaga_gfx::VulkanInfo as RutabagaVulkanInfo;
+use rutabaga_gfx::RUTABAGA_BLOB_MEM_GUEST;
 use rutabaga_gfx::RUTABAGA_FLAG_FENCE;
 use rutabaga_gfx::RUTABAGA_FLAG_FENCE_HOST_SHAREABLE;
 use rutabaga_gfx::RUTABAGA_MAP_ACCESS_RW;
@@ -98,6 +98,13 @@ fn udmabuf_from_memfd(memfd_fd: u32, size: u64) -> Result<OwnedDescriptor, Magma
 
     // SAFETY: the ioctl returned a fresh, owning dma-buf file descriptor.
     Ok(unsafe { OwnedDescriptor::from_raw_descriptor(ret) })
+}
+
+/// Dups the descriptor of a response handle so kumquat can keep a reference
+/// to the client-visible memory after the handle itself is sent to the
+/// client.
+fn descriptor_try_clone(handle: &MagmaGpuHandle) -> Option<OwnedDescriptor> {
+    handle.os_handle.try_clone().ok()
 }
 
 /// Backing memory for GUEST guest-handle blobs: the memfd provides the mapping
@@ -207,9 +214,23 @@ pub struct KumquatGpuConnection {
     stream: KumquatStream,
 }
 
+/// A blob whose fd was exported to the client. The dup is kept so the
+/// client-visible mapping can be re-attached to the restored gfxstream
+/// resource after a snapshot restore.
+struct ExportedBlob {
+    ctx_id: u32,
+    blob_id: u32,
+    size: u64,
+    descriptor: OwnedDescriptor,
+    /// Mapping of `descriptor`, created at re-attach time and kept alive for
+    /// as long as the gfxstream resource uses the address.
+    mapping: Option<MemoryMapping>,
+}
+
 pub struct KumquatGpuResource {
     attached_contexts: Set<u32>,
     mapping: Option<MemoryMapping>,
+    exported: Option<ExportedBlob>,
 }
 
 pub struct FenceData {
@@ -430,6 +451,7 @@ impl KumquatGpuConnection {
                         KumquatGpuResource {
                             attached_contexts: Default::default(),
                             mapping: Some(mapping),
+                            exported: None,
                         },
                     );
 
@@ -616,6 +638,22 @@ impl KumquatGpuConnection {
                             MagmaGpuHandle::try_from(handle)?
                         }
                     };
+
+                    // Keep a dup of the fd handed to the client: after a
+                    // snapshot restore the gfxstream resource must be
+                    // re-attached to this client-visible memory (e.g. the ASG
+                    // ring) instead of a fresh allocation.
+                    let exported = match descriptor_try_clone(&handle) {
+                        Some(descriptor) => Some(ExportedBlob {
+                            ctx_id: cmd.ctx_id,
+                            blob_id: cmd.blob_id as u32,
+                            size: cmd.size as u64,
+                            descriptor,
+                            mapping: None,
+                        }),
+                        None => None,
+                    };
+
                     let mut vk_info: RutabagaVulkanInfo = Default::default();
                     if let Ok(vulkan_info) = kumquat_gpu.rutabaga.vulkan_info(resource_id) {
                         vk_info = vulkan_info;
@@ -626,6 +664,7 @@ impl KumquatGpuConnection {
                         KumquatGpuResource {
                             attached_contexts: Set::from([cmd.ctx_id]),
                             mapping,
+                            exported,
                         },
                     );
 
@@ -663,6 +702,8 @@ impl KumquatGpuConnection {
                     self.stream.write(KumquatGpuProtocolWrite::Cmd(resp))?;
                 }
                 KumquatGpuProtocol::SnapshotRestore => {
+                    // Re-attach lives in KumquatGpu::rutabaga_restore — the
+                    // SIGUSR2 path bypasses this protocol arm.
                     kumquat_gpu.rutabaga.restore(Path::new(SNAPSHOT_DIR))?;
 
                     let resp = kumquat_gpu_protocol_ctrl_hdr {
@@ -699,6 +740,45 @@ impl KumquatGpu {
     }
 
     pub fn rutabaga_restore(&mut self, directory: &std::path::Path) -> KumquatGpuResult<()> {
+        // Re-attach the client-visible blob mappings (e.g. the ASG ring the
+        // client keeps mapping) BEFORE the restore: the gfxstream frontend
+        // consumes the registered mappings while recreating the resources.
+        for (resource_id, res) in self.resources.iter_mut() {
+            let Some(exported) = &mut res.exported else {
+                continue;
+            };
+            if exported.mapping.is_some() {
+                continue;
+            }
+            let Ok(clone) = exported.descriptor.try_clone() else {
+                continue;
+            };
+            match MemoryMapping::from_safe_descriptor(
+                clone,
+                exported.size as usize,
+                RUTABAGA_MAP_CACHE_CACHED | RUTABAGA_MAP_ACCESS_RW,
+            ) {
+                Ok(mapping) => {
+                    let raw = mapping.as_raw_mapping();
+                    eprintln!(
+                        "kumquat: reattach resource {resource_id} ctx {} blob {} at {:#x}",
+                        exported.ctx_id, exported.blob_id, raw.ptr
+                    );
+                    #[cfg(feature = "gfxstream")]
+                    rutabaga_gfx::reattach_blob_mapping(
+                        exported.ctx_id,
+                        exported.blob_id,
+                        raw.ptr as *mut c_void,
+                        RUTABAGA_MAP_CACHE_CACHED,
+                    );
+                    exported.mapping = Some(mapping);
+                }
+                Err(e) => {
+                    eprintln!("kumquat: re-attach mapping failed: {e:?}");
+                }
+            }
+        }
+
         self.rutabaga.restore(directory)?;
         self.reattach_backings();
         Ok(())
@@ -716,7 +796,9 @@ impl KumquatGpu {
                     len: raw.size as usize,
                 }];
                 if let Err(e) = self.rutabaga.attach_backing(*resource_id, vecs) {
-                    eprintln!("kumquat: re-attach backing for resource {resource_id} failed: {e:?}");
+                    eprintln!(
+                        "kumquat: re-attach backing for resource {resource_id} failed: {e:?}"
+                    );
                 }
             }
         }
