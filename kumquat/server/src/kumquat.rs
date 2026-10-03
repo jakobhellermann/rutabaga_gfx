@@ -30,8 +30,22 @@ pub struct Kumquat {
 }
 
 impl Kumquat {
+    pub fn rutabaga_snapshot(&self, directory: &std::path::Path) -> KumquatGpuResult<()> {
+        if let Some(gpu) = &self.kumquat_gpu_opt {
+            gpu.rutabaga_snapshot(directory)?;
+        }
+        Ok(())
+    }
+
+    pub fn rutabaga_restore(&mut self, directory: &std::path::Path) -> KumquatGpuResult<()> {
+        if let Some(gpu) = &mut self.kumquat_gpu_opt {
+            gpu.rutabaga_restore(directory)?;
+        }
+        Ok(())
+    }
+
     pub fn run(&mut self) -> KumquatGpuResult<()> {
-        let events = self.wait_ctx.wait(WaitTimeout::NoTimeout)?;
+        let events = self.wait_ctx.wait(WaitTimeout::Finite(std::time::Duration::from_millis(500)))?;
         for event in events {
             let mut hung_up = false;
             match self.connections.entry(event.connection_id) {
@@ -40,7 +54,8 @@ impl Kumquat {
                     match connection {
                         KumquatConnection::GpuListener => {
                             if let Some(ref listener) = self.gpu_listener_opt {
-                                let stream = listener.accept()?;
+                                // A failed accept is transient — skip it, keep serving.
+                                let Ok(stream) = listener.accept() else { continue };
                                 self.connection_id += 1;
                                 let new_gpu_conn = KumquatGpuConnection::new(stream);
                                 self.wait_ctx.add(
@@ -56,8 +71,17 @@ impl Kumquat {
                         KumquatConnection::GpuConnection(ref mut gpu_conn) => {
                             if event.readable {
                                 if let Some(ref mut kumquat_gpu) = self.kumquat_gpu_opt {
-                                    hung_up =
-                                        !gpu_conn.process_command(kumquat_gpu)? && event.hung_up;
+                                    // A client dying mid-protocol (ECONNRESET etc.) drops that
+                                    // connection — it must not take the server down with it.
+                                    hung_up = match gpu_conn.process_command(kumquat_gpu) {
+                                        Ok(processed) => !processed && event.hung_up,
+                                        Err(e) => {
+                                            eprintln!(
+                                                "kumquat: client connection error: {e}"
+                                            );
+                                            true
+                                        }
+                                    };
                                 }
                             }
 

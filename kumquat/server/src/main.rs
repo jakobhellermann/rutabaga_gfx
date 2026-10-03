@@ -5,6 +5,19 @@
 mod kumquat;
 mod kumquat_gpu;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static SNAPSHOT_REQUESTED: AtomicBool = AtomicBool::new(false);
+static RESTORE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_sigusr1(_: libc::c_int) {
+    SNAPSHOT_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+extern "C" fn on_sigusr2(_: libc::c_int) {
+    RESTORE_REQUESTED.store(true, Ordering::SeqCst);
+}
+
 use clap::Parser;
 use kumquat::KumquatBuilder;
 use magma_gpu::util::FromRawDescriptor;
@@ -38,6 +51,11 @@ struct Args {
 fn main() -> KumquatGpuResult<()> {
     let args = Args::parse();
 
+    unsafe {
+        libc::signal(libc::SIGUSR1, on_sigusr1 as *const () as usize);
+        libc::signal(libc::SIGUSR2, on_sigusr2 as *const () as usize);
+    }
+
     let mut kumquat = KumquatBuilder::new()
         .set_capset_names(args.capset_names)
         .set_gpu_socket((!args.gpu_socket_path.is_empty()).then_some(args.gpu_socket_path))
@@ -54,6 +72,27 @@ fn main() -> KumquatGpuResult<()> {
     }
 
     loop {
+        if SNAPSHOT_REQUESTED.swap(false, Ordering::SeqCst) {
+            println!("kumquat: snapshot requested");
+            let dir = kumquat_gpu_snapshot_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            match kumquat.rutabaga_snapshot(std::path::Path::new(&dir)) {
+                Ok(()) => println!("kumquat: snapshot written to {}", dir),
+                Err(e) => println!("kumquat: snapshot failed: {:?}", e),
+            }
+        }
+        if RESTORE_REQUESTED.swap(false, Ordering::SeqCst) {
+            println!("kumquat: restore requested");
+            let dir = kumquat_gpu_snapshot_dir();
+            match kumquat.rutabaga_restore(std::path::Path::new(&dir)) {
+                Ok(()) => println!("kumquat: restore done from {}", dir),
+                Err(e) => println!("kumquat: restore failed: {:?}", e),
+            }
+        }
         kumquat.run()?;
     }
+}
+
+fn kumquat_gpu_snapshot_dir() -> String {
+    "/tmp/kumquat-snapshot".to_string()
 }
