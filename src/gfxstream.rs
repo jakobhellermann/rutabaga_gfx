@@ -159,6 +159,16 @@ pub fn reattach_blob_mapping(ctx_id: u32, blob_id: u32, addr: *mut c_void, cachi
     unsafe { stream_renderer_reattach_blob_mapping(ctx_id, blob_id, addr, caching) };
 }
 
+/// Re-registers a blob descriptor with gfxstream's external object manager so
+/// a replayed vkAllocateMemory during restore can import it again (the
+/// original descriptor is consumed by the first mapping). Takes ownership of
+/// `fd`.
+pub fn reattach_blob_descriptor(ctx_id: u32, blob_id: u64, fd: i32, stream_handle_type: u32) {
+    // SAFETY: fd is a valid caller-owned descriptor whose ownership moves to
+    // gfxstream; the C function only registers it.
+    unsafe { stream_renderer_reattach_blob_descriptor(ctx_id, blob_id, fd, stream_handle_type) };
+}
+
 extern "C" {
     // Entry point for the stream renderer.
     fn stream_renderer_init(
@@ -240,6 +250,12 @@ extern "C" {
         blob_id: u32,
         addr: *mut c_void,
         caching: u32,
+    );
+    fn stream_renderer_reattach_blob_descriptor(
+        ctx_id: u32,
+        blob_id: u64,
+        fd: i32,
+        stream_handle_type: u32,
     );
     fn stream_renderer_resource_map(
         res_handle: u32,
