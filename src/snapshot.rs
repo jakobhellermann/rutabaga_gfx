@@ -34,7 +34,7 @@ impl RutabagaSnapshotWriter {
     pub fn add_namespace(&self, name: &str) -> RutabagaResult<Self> {
         let directory = self.dir.join(name);
 
-        std::fs::create_dir(&directory).map_err(MagmaGpuError::IoError)?;
+        std::fs::create_dir_all(&directory).map_err(MagmaGpuError::IoError)?;
 
         Ok(Self::from_existing(directory))
     }
@@ -43,7 +43,8 @@ impl RutabagaSnapshotWriter {
         let fragment_path = self.dir.join(name);
         let fragment_file = File::options()
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(true)
             .open(fragment_path)
             .map_err(|_| RutabagaError::SnapshotError)?;
         let mut fragment_writer = BufWriter::new(fragment_file);

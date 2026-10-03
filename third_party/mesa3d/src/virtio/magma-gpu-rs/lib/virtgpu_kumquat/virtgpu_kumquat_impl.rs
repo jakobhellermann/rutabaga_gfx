@@ -145,6 +145,9 @@ impl VirtGpuKumquat {
             VIRTGPU_KUMQUAT_PARAM_SUPPORTED_CAPSET_IDS => self.capset_mask,
             VIRTGPU_KUMQUAT_PARAM_EXPLICIT_DEBUG_NAME => 0,
             VIRTGPU_KUMQUAT_PARAM_FENCE_PASSING => 1,
+            // DRM param 10: CREATE_GUEST_HANDLE — exportable blobs need this so the
+            // guest ICD uses the guest-handle blob path (snapshot/restore requires it).
+            10 => 1,
             _ => return Err(Error::Unsupported),
         };
 
