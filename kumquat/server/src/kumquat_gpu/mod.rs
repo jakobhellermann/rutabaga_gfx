@@ -17,9 +17,9 @@ use magma_gpu::protocols::kumquat_gpu_protocol::*;
 use magma_gpu::util::create_event_pair;
 use magma_gpu::util::AsBorrowedDescriptor;
 use magma_gpu::util::AsRawDescriptor;
+use magma_gpu::util::FromRawDescriptor;
 use magma_gpu::util::Error as MagmaGpuError;
 use magma_gpu::util::EventSignaler;
-use magma_gpu::util::FromRawDescriptor;
 use magma_gpu::util::Handle as MagmaGpuHandle;
 use magma_gpu::util::MemoryMapping;
 use magma_gpu::util::OwnedDescriptor;
@@ -38,10 +38,10 @@ use rutabaga_gfx::RutabagaFence;
 use rutabaga_gfx::RutabagaFenceHandler;
 use rutabaga_gfx::RutabagaHandle;
 use rutabaga_gfx::RutabagaIovec;
+use rutabaga_gfx::RUTABAGA_BLOB_MEM_GUEST;
 use rutabaga_gfx::RutabagaWsi;
 use rutabaga_gfx::Transfer3D;
 use rutabaga_gfx::VulkanInfo as RutabagaVulkanInfo;
-use rutabaga_gfx::RUTABAGA_BLOB_MEM_GUEST;
 use rutabaga_gfx::RUTABAGA_FLAG_FENCE;
 use rutabaga_gfx::RUTABAGA_FLAG_FENCE_HOST_SHAREABLE;
 use rutabaga_gfx::RUTABAGA_MAP_ACCESS_RW;
@@ -756,19 +756,19 @@ impl KumquatGpu {
         // client keeps mapping) BEFORE the restore: the gfxstream frontend
         // consumes the registered mappings while recreating the resources.
         for (resource_id, res) in self.resources.iter_mut() {
-            let Some(exported) = &mut res.exported else {
-                continue;
-            };
-            // Re-register the dma-buf descriptor first: the replayed
-            // vkAllocateMemory imports it into the restored VkDeviceMemory.
-            if let Some(dma_buf) = exported.dma_buf.take() {
-                use magma_gpu::util::IntoRawDescriptor;
-                rutabaga_gfx::reattach_blob_descriptor(
-                    exported.ctx_id,
-                    exported.blob_id as u64,
-                    dma_buf.into_raw_descriptor(),
-                    MAGMA_GPU_HANDLE_TYPE_MEM_DMABUF,
-                );
+            let Some(exported) = &mut res.exported else { continue };
+            // Re-register a fresh dup of the dma-buf descriptor on every
+            // restore: the replayed vkAllocateMemory consumes it each time.
+            if let Some(dma_buf) = &exported.dma_buf {
+                if let Ok(dup) = dma_buf.try_clone() {
+                    use magma_gpu::util::IntoRawDescriptor;
+                    rutabaga_gfx::reattach_blob_descriptor(
+                        exported.ctx_id,
+                        exported.blob_id as u64,
+                        dup.into_raw_descriptor(),
+                        MAGMA_GPU_HANDLE_TYPE_MEM_DMABUF,
+                    );
+                }
             }
             if exported.mapping.is_none() {
                 let Ok(clone) = exported.descriptor.try_clone() else {
@@ -823,9 +823,7 @@ impl KumquatGpu {
                     len: raw.size as usize,
                 }];
                 if let Err(e) = self.rutabaga.attach_backing(*resource_id, vecs) {
-                    eprintln!(
-                        "kumquat: re-attach backing for resource {resource_id} failed: {e:?}"
-                    );
+                    eprintln!("kumquat: re-attach backing for resource {resource_id} failed: {e:?}");
                 }
             }
         }
