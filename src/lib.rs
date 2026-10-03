@@ -9,6 +9,8 @@ mod context_common;
 mod cross_domain;
 mod generated;
 mod gfxstream;
+#[cfg(feature = "gfxstream")]
+pub use gfxstream::reattach_blob_mapping;
 mod handle;
 mod magma;
 #[macro_use]
