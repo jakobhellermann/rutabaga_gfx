@@ -516,3 +516,15 @@ impl AsBorrowedDescriptor for KumquatGpuConnection {
         self.stream.as_borrowed_descriptor()
     }
 }
+
+impl KumquatGpu {
+    pub fn rutabaga_snapshot(&self, directory: &std::path::Path) -> KumquatGpuResult<()> {
+        self.rutabaga.snapshot(directory)?;
+        Ok(())
+    }
+
+    pub fn rutabaga_restore(&mut self, directory: &std::path::Path) -> KumquatGpuResult<()> {
+        self.rutabaga.restore(directory)?;
+        Ok(())
+    }
+}

@@ -381,6 +381,7 @@ name = "kumquat_virtio"
 version = "0.1.85"
 dependencies = [
  "clap",
+ "libc",
  "log",
  "magma-gpu",
  "remain",
