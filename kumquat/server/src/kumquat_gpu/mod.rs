@@ -525,6 +525,25 @@ impl KumquatGpu {
 
     pub fn rutabaga_restore(&mut self, directory: &std::path::Path) -> KumquatGpuResult<()> {
         self.rutabaga.restore(directory)?;
+        self.reattach_backings();
         Ok(())
+    }
+
+    /// Rutabaga::restore() rebuilds resources without backing (the iovec
+    /// pointers are VMM state). Our SHM mappings survive — re-bind them so the
+    /// restored resources point at the same memory as before.
+    fn reattach_backings(&mut self) {
+        for (resource_id, res) in &self.resources {
+            if let Some(mapping) = &res.mapping {
+                let raw = mapping.as_raw_mapping();
+                let vecs = vec![RutabagaIovec {
+                    base: raw.ptr as *mut c_void,
+                    len: raw.size as usize,
+                }];
+                if let Err(e) = self.rutabaga.attach_backing(*resource_id, vecs) {
+                    eprintln!("kumquat: re-attach backing for resource {resource_id} failed: {e:?}");
+                }
+            }
+        }
     }
 }
