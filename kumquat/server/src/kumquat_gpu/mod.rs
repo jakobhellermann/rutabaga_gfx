@@ -5,6 +5,7 @@
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap as Map;
 use std::collections::BTreeSet as Set;
+use std::os::fd::AsRawFd;
 use std::os::raw::c_void;
 use std::path::Path;
 use std::sync::Arc;
@@ -15,6 +16,8 @@ use magma_gpu::protocols::ipc::KumquatStream;
 use magma_gpu::protocols::kumquat_gpu_protocol::*;
 use magma_gpu::util::create_event_pair;
 use magma_gpu::util::AsBorrowedDescriptor;
+use magma_gpu::util::AsRawDescriptor;
+use magma_gpu::util::FromRawDescriptor;
 use magma_gpu::util::Error as MagmaGpuError;
 use magma_gpu::util::EventSignaler;
 use magma_gpu::util::Handle as MagmaGpuHandle;
@@ -22,6 +25,7 @@ use magma_gpu::util::MemoryMapping;
 use magma_gpu::util::OwnedDescriptor;
 use magma_gpu::util::SharedMemory;
 use magma_gpu::util::Tube;
+use magma_gpu::util::MAGMA_GPU_HANDLE_TYPE_MEM_DMABUF;
 use magma_gpu::util::MAGMA_GPU_HANDLE_TYPE_MEM_SHM;
 use remain::sorted;
 use rutabaga_gfx::calculate_capset_mask;
@@ -32,7 +36,9 @@ use rutabaga_gfx::RutabagaBuilder;
 use rutabaga_gfx::RutabagaError;
 use rutabaga_gfx::RutabagaFence;
 use rutabaga_gfx::RutabagaFenceHandler;
+use rutabaga_gfx::RutabagaHandle;
 use rutabaga_gfx::RutabagaIovec;
+use rutabaga_gfx::RUTABAGA_BLOB_MEM_GUEST;
 use rutabaga_gfx::RutabagaWsi;
 use rutabaga_gfx::Transfer3D;
 use rutabaga_gfx::VulkanInfo as RutabagaVulkanInfo;
@@ -43,6 +49,135 @@ use rutabaga_gfx::RUTABAGA_MAP_CACHE_CACHED;
 use thiserror::Error;
 
 const SNAPSHOT_DIR: &str = "/tmp/";
+
+/// `STREAM_BLOB_FLAG_CREATE_GUEST_HANDLE` (virtio-gpu spec / gfxstream's
+/// stream_renderer.h); not modelled as a rutabaga constant.
+const BLOB_FLAG_CREATE_GUEST_HANDLE: u32 = 0x0008;
+/// `UDMABUF_CREATE` from linux/udmabuf.h: `_IOW('u', 0x42, struct udmabuf_create)`.
+/// `struct udmabuf_create` is 24 bytes (u32 memfd, u32 flags, u64 offset, u64 size).
+const UDMABUF_CREATE: libc::c_ulong = 0x4018_7542;
+const UDMABUF_FLAGS_CLOEXEC: u32 = 1 << 0;
+
+/// Arguments of the `UDMABUF_CREATE` ioctl (linux/udmabuf.h).
+#[repr(C)]
+#[derive(Default)]
+struct UdmabufCreate {
+    memfd: u32,
+    flags: u32,
+    offset: u64,
+    size: u64,
+}
+
+/// Converts a sealed memfd into a dma-buf whose pages alias the memfd's.
+///
+/// gfxstream imports guest-handle blobs into the host VkDeviceMemory via
+/// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT`, so the descriptor handed
+/// to rutabaga must be a real dma-buf, not a plain memfd. The udmabuf kernel
+/// interface provides that conversion without a GPU round-trip; the memfd's
+/// pages stay shared with any mapping of it.
+fn udmabuf_from_memfd(memfd_fd: u32, size: u64) -> Result<OwnedDescriptor, MagmaGpuError> {
+    let dev = std::fs::OpenOptions::new()
+        .read(true)
+        .open("/dev/udmabuf")
+        .map_err(MagmaGpuError::IoError)?;
+
+    let create = UdmabufCreate {
+        memfd: memfd_fd,
+        flags: UDMABUF_FLAGS_CLOEXEC,
+        offset: 0,
+        size,
+    };
+
+    // SAFETY: `dev` is a valid /dev/udmabuf file descriptor and `create` is a
+    // valid, correctly laid-out udmabuf_create struct referenced for the
+    // duration of the ioctl; the kernel only reads it and returns a new fd.
+    let ret = unsafe { libc::ioctl(dev.as_raw_fd(), UDMABUF_CREATE, &create) };
+    if ret < 0 {
+        return Err(MagmaGpuError::IoError(std::io::Error::last_os_error()));
+    }
+
+    // SAFETY: the ioctl returned a fresh, owning dma-buf file descriptor.
+    Ok(unsafe { OwnedDescriptor::from_raw_descriptor(ret) })
+}
+
+/// Backing memory for GUEST guest-handle blobs: the memfd provides the mapping
+/// (the stand-in for guest kernel memory), the udmabuf is the dma-buf handed
+/// to rutabaga/gfxstream for the host-side import, and the response handle is
+/// what the client mmaps as its blob memory.
+struct GuestBlobBacking {
+    mapping: MemoryMapping,
+    iovecs: Vec<RutabagaIovec>,
+    guest_handle: MagmaGpuHandle,
+    response_handle: MagmaGpuHandle,
+}
+
+/// Creates the backing for a `BLOB_MEM_GUEST` + `CREATE_GUEST_HANDLE` blob.
+///
+/// There is no guest kernel to allocate and export the blob's memory, so
+/// kumquat plays that role itself (mirroring the ResourceCreate3d flow):
+/// allocate a sealed memfd, export it as a dma-buf via /dev/udmabuf, pass the
+/// dma-buf to rutabaga as the blob's guest handle and attach the memfd mapping
+/// as the resource backing.
+fn create_guest_blob_backing(size: u64) -> Result<GuestBlobBacking, MagmaGpuError> {
+    let descriptor: OwnedDescriptor = SharedMemory::new("kumquat-guest-blob", size)?.into();
+
+    // udmabuf requires the memfd to be sealed against shrinking so the pages
+    // it pins cannot disappear.
+    // SAFETY: `descriptor` is a valid memfd; F_ADD_SEALS only sets the seal
+    // flags on it and fails if they cannot be applied.
+    let ret = unsafe {
+        libc::fcntl(
+            descriptor.as_raw_descriptor(),
+            libc::F_ADD_SEALS,
+            libc::F_SEAL_SHRINK,
+        )
+    };
+    if ret < 0 {
+        return Err(MagmaGpuError::IoError(std::io::Error::last_os_error()));
+    }
+
+    let dma_buf = udmabuf_from_memfd(
+        // SAFETY: borrowed only for the ioctl call; `descriptor` stays valid
+        // and owned here, the fd is not closed by this conversion.
+        descriptor.as_raw_descriptor() as u32,
+        size,
+    )?;
+
+    let clone = descriptor.try_clone()?;
+    let mapping = MemoryMapping::from_safe_descriptor(
+        clone,
+        size as usize,
+        RUTABAGA_MAP_CACHE_CACHED | RUTABAGA_MAP_ACCESS_RW,
+    )?;
+    let rutabaga_mapping = mapping.as_raw_mapping();
+
+    let iovecs = vec![RutabagaIovec {
+        base: rutabaga_mapping.ptr as *mut c_void,
+        len: size as usize,
+    }];
+
+    let handle = MagmaGpuHandle {
+        // SAFETY: `dma_buf` is an owned dma-buf fd that gfxstream takes over;
+        // no other code retains it after the move into the handle.
+        os_handle: dma_buf,
+        handle_type: MAGMA_GPU_HANDLE_TYPE_MEM_DMABUF,
+    };
+
+    // The client mmaps the fd from the create response (its stand-in for the
+    // guest kernel's GEM object). A dup of the memfd aliases the same pages as
+    // the dma-buf gfxstream imports.
+    let response_handle = MagmaGpuHandle {
+        os_handle: descriptor.try_clone()?,
+        handle_type: MAGMA_GPU_HANDLE_TYPE_MEM_SHM,
+    };
+
+    Ok(GuestBlobBacking {
+        mapping,
+        iovecs,
+        guest_handle: handle,
+        response_handle,
+    })
+}
 
 #[sorted]
 #[non_exhaustive]
@@ -431,16 +566,56 @@ impl KumquatGpuConnection {
                         size: cmd.size,
                     };
 
+                    // GUEST blobs with CREATE_GUEST_HANDLE: there is no guest
+                    // kernel to allocate/export the blob's memory, so kumquat
+                    // provides it (sealed memfd, exported as dma-buf). gfxstream
+                    // dereferences the handle unconditionally for this blob type
+                    // (virtio_gpu_resource.cpp: ManagedDescriptor) — passing None
+                    // segfaults the backend. All other blob types carry their own
+                    // or no backing and take None like before.
+                    let backing = if cmd.blob_mem == RUTABAGA_BLOB_MEM_GUEST
+                        && (cmd.blob_flags & BLOB_FLAG_CREATE_GUEST_HANDLE) != 0
+                    {
+                        Some(create_guest_blob_backing(cmd.size as u64)?)
+                    } else {
+                        None
+                    };
+
+                    let (iovecs, handle, response_handle, mapping) = match backing {
+                        Some(GuestBlobBacking {
+                            mapping,
+                            iovecs,
+                            guest_handle,
+                            response_handle,
+                        }) => (
+                            Some(iovecs),
+                            Some(RutabagaHandle::from(guest_handle)),
+                            Some(response_handle),
+                            Some(mapping),
+                        ),
+                        None => (None, None, None, None),
+                    };
+
                     kumquat_gpu.rutabaga.resource_create_blob(
                         cmd.ctx_id,
                         resource_id,
                         resource_create_blob,
-                        None,
-                        None,
+                        iovecs,
+                        handle,
                     )?;
 
-                    let handle = kumquat_gpu.rutabaga.export_blob(resource_id)?;
-                    let handle = MagmaGpuHandle::try_from(handle)?;
+                    // GUEST blob memory belongs to the guest: the response
+                    // carries a dup of the guest memory (the client mmaps it),
+                    // and gfxstream holds the dma-buf for the vkAllocateMemory
+                    // import. export_blob would fail here (the resource has no
+                    // blob memory of its own) and must not be used.
+                    let handle = match response_handle {
+                        Some(handle) => handle,
+                        None => {
+                            let handle = kumquat_gpu.rutabaga.export_blob(resource_id)?;
+                            MagmaGpuHandle::try_from(handle)?
+                        }
+                    };
                     let mut vk_info: RutabagaVulkanInfo = Default::default();
                     if let Ok(vulkan_info) = kumquat_gpu.rutabaga.vulkan_info(resource_id) {
                         vk_info = vulkan_info;
@@ -450,7 +625,7 @@ impl KumquatGpuConnection {
                         resource_id,
                         KumquatGpuResource {
                             attached_contexts: Set::from([cmd.ctx_id]),
-                            mapping: None,
+                            mapping,
                         },
                     );
 
