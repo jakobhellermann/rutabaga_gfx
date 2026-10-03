@@ -770,35 +770,40 @@ impl KumquatGpu {
                     MAGMA_GPU_HANDLE_TYPE_MEM_DMABUF,
                 );
             }
-            if exported.mapping.is_some() {
-                continue;
-            }
-            let Ok(clone) = exported.descriptor.try_clone() else {
-                continue;
-            };
-            match MemoryMapping::from_safe_descriptor(
-                clone,
-                exported.size as usize,
-                RUTABAGA_MAP_CACHE_CACHED | RUTABAGA_MAP_ACCESS_RW,
-            ) {
-                Ok(mapping) => {
-                    let raw = mapping.as_raw_mapping();
-                    eprintln!(
-                        "kumquat: reattach resource {resource_id} ctx {} blob {} at {:#x}",
-                        exported.ctx_id, exported.blob_id, raw.ptr
-                    );
-                    rutabaga_gfx::reattach_blob_mapping(
-                        exported.ctx_id,
-                        exported.blob_id,
-                        raw.ptr as *mut c_void,
-                        RUTABAGA_MAP_CACHE_CACHED,
-                    );
-                    exported.mapping = Some(mapping);
-                }
-                Err(e) => {
-                    eprintln!("kumquat: re-attach mapping failed: {e:?}");
+            if exported.mapping.is_none() {
+                let Ok(clone) = exported.descriptor.try_clone() else {
+                    continue;
+                };
+                match MemoryMapping::from_safe_descriptor(
+                    clone,
+                    exported.size as usize,
+                    RUTABAGA_MAP_CACHE_CACHED | RUTABAGA_MAP_ACCESS_RW,
+                ) {
+                    Ok(mapping) => {
+                        let raw = mapping.as_raw_mapping();
+                        eprintln!(
+                            "kumquat: reattach resource {resource_id} ctx {} blob {} at {:#x}",
+                            exported.ctx_id, exported.blob_id, raw.ptr
+                        );
+                        exported.mapping = Some(mapping);
+                    }
+                    Err(e) => {
+                        eprintln!("kumquat: re-attach mapping failed: {e:?}");
+                        continue;
+                    }
                 }
             }
+            // Re-register on every restore: the external object manager
+            // consumes the mapping on use, and the mapping itself stays alive
+            // in `exported`.
+            let mapping = exported.mapping.as_ref().unwrap();
+            let raw = mapping.as_raw_mapping();
+            rutabaga_gfx::reattach_blob_mapping(
+                exported.ctx_id,
+                exported.blob_id as u32,
+                raw.ptr as *mut c_void,
+                RUTABAGA_MAP_CACHE_CACHED,
+            );
         }
 
         self.rutabaga.restore(directory)?;
