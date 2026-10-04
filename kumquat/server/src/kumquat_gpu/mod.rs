@@ -20,8 +20,8 @@ use magma_gpu::util::create_event_pair;
 
 /// Number of completed GPU snapshots. A resource with
 /// `created_epoch == SNAPSHOT_EPOCH` was created after the last snapshot and
-/// belongs to no restore point yet. Detector only — nothing here changes
-/// restore behavior.
+/// belongs to no restore point yet. Snapshot resources detached later are
+/// archived until the next restore so their host descriptors stay available.
 static SNAPSHOT_EPOCH: AtomicU64 = AtomicU64::new(0);
 use magma_gpu::util::AsBorrowedDescriptor;
 use magma_gpu::util::AsRawDescriptor;
@@ -280,6 +280,10 @@ pub struct KumquatGpu {
     fence_state: FenceState,
     id_allocator: u32,
     resources: Map<u32, KumquatGpuResource>,
+    /// Context attachments at the last GPU snapshot.
+    snapshot_contexts: Map<u32, Set<u32>>,
+    /// Snapshot resources unreferenced by the guest since that snapshot.
+    archived_resources: Map<u32, KumquatGpuResource>,
 }
 
 impl KumquatGpu {
@@ -316,6 +320,8 @@ impl KumquatGpu {
             fence_state,
             id_allocator: 0,
             resources: Default::default(),
+            snapshot_contexts: Default::default(),
+            archived_resources: Default::default(),
         })
     }
 
@@ -403,12 +409,30 @@ impl KumquatGpuConnection {
                 KumquatGpuProtocol::CtxAttachResource(cmd) => {
                     kumquat_gpu
                         .rutabaga
-                        .context_attach_resource(cmd.ctx_id, cmd.resource_id)?;
+                        .context_attach_resource(cmd.ctx_id, cmd.resource_id)
+                        .map_err(|error| {
+                            eprintln!(
+                                "kumquat: attach ctx {} resource {} failed: {error:?} (wrapper_present={})",
+                                cmd.ctx_id,
+                                cmd.resource_id,
+                                kumquat_gpu.resources.contains_key(&cmd.resource_id)
+                            );
+                            error
+                        })?;
                 }
                 KumquatGpuProtocol::CtxDetachResource(cmd) => {
                     kumquat_gpu
                         .rutabaga
-                        .context_detach_resource(cmd.ctx_id, cmd.resource_id)?;
+                        .context_detach_resource(cmd.ctx_id, cmd.resource_id)
+                        .map_err(|error| {
+                            eprintln!(
+                                "kumquat: detach ctx {} resource {} failed: {error:?} (wrapper_present={})",
+                                cmd.ctx_id,
+                                cmd.resource_id,
+                                kumquat_gpu.resources.contains_key(&cmd.resource_id)
+                            );
+                            error
+                        })?;
 
                     let mut resource = kumquat_gpu
                         .resources
@@ -418,10 +442,35 @@ impl KumquatGpuConnection {
                     resource.attached_contexts.remove(&cmd.ctx_id);
                     if resource.attached_contexts.is_empty() {
                         if resource.mapping.is_some() {
-                            kumquat_gpu.rutabaga.detach_backing(cmd.resource_id)?;
+                            kumquat_gpu
+                                .rutabaga
+                                .detach_backing(cmd.resource_id)
+                                .map_err(|error| {
+                                    eprintln!(
+                                        "kumquat: detach backing resource {} failed: {error:?}",
+                                        cmd.resource_id
+                                    );
+                                    error
+                                })?;
                         }
 
-                        kumquat_gpu.rutabaga.unref_resource(cmd.resource_id)?;
+                        kumquat_gpu
+                            .rutabaga
+                            .unref_resource(cmd.resource_id)
+                            .map_err(|error| {
+                                eprintln!(
+                                    "kumquat: unref resource {} failed: {error:?}",
+                                    cmd.resource_id
+                                );
+                                error
+                            })?;
+                        if let Some(contexts) = kumquat_gpu.snapshot_contexts.get(&cmd.resource_id)
+                        {
+                            resource.attached_contexts = contexts.clone();
+                            kumquat_gpu
+                                .archived_resources
+                                .insert(cmd.resource_id, resource);
+                        }
                     } else {
                         kumquat_gpu.resources.insert(cmd.resource_id, resource);
                     }
@@ -766,6 +815,12 @@ impl KumquatGpu {
             self.resources.len()
         );
         self.rutabaga.snapshot(directory)?;
+        self.snapshot_contexts = self
+            .resources
+            .iter()
+            .map(|(id, resource)| (*id, resource.attached_contexts.clone()))
+            .collect();
+        self.archived_resources.clear();
         // Everything created from now on belongs to the next era.
         SNAPSHOT_EPOCH.fetch_add(1, Ordering::SeqCst);
         eprintln!(
@@ -789,6 +844,18 @@ impl KumquatGpu {
                 post_checkpoint.len(),
                 post_checkpoint
             );
+        }
+        self.resources
+            .retain(|id, _| self.snapshot_contexts.contains_key(id));
+        for (id, resource) in std::mem::take(&mut self.archived_resources) {
+            self.resources.insert(id, resource);
+        }
+        for (id, contexts) in &self.snapshot_contexts {
+            let resource = self
+                .resources
+                .get_mut(id)
+                .ok_or(RutabagaError::InvalidResourceId)?;
+            resource.attached_contexts = contexts.clone();
         }
         // Re-attach the client-visible blob mappings (e.g. the ASG ring the
         // client keeps mapping) BEFORE the restore: the gfxstream frontend
