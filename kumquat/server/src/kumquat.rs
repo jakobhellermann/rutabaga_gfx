@@ -30,8 +30,8 @@ pub struct Kumquat {
 }
 
 impl Kumquat {
-    pub fn rutabaga_snapshot(&self, directory: &std::path::Path) -> KumquatGpuResult<()> {
-        if let Some(gpu) = &self.kumquat_gpu_opt {
+    pub fn rutabaga_snapshot(&mut self, directory: &std::path::Path) -> KumquatGpuResult<()> {
+        if let Some(gpu) = &mut self.kumquat_gpu_opt {
             gpu.rutabaga_snapshot(directory)?;
         }
         Ok(())

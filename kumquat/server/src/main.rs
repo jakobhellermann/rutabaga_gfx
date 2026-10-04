@@ -83,16 +83,30 @@ fn main() -> KumquatGpuResult<()> {
             println!("kumquat: snapshot requested");
             let dir = kumquat_gpu_snapshot_dir();
             let _ = std::fs::create_dir_all(&dir);
+            // valo waits for this marker before resuming the guest, so it
+            // must not exist while the snapshot is running.
+            let _ = std::fs::remove_file(snapshot_complete_marker());
             match kumquat.rutabaga_snapshot(std::path::Path::new(&dir)) {
-                Ok(()) => println!("kumquat: snapshot written to {}", dir),
+                Ok(()) => {
+                    if let Err(e) = std::fs::write(snapshot_complete_marker(), b"ok") {
+                        println!("kumquat: snapshot marker write failed: {e:?}");
+                    }
+                    println!("kumquat: snapshot written to {}", dir);
+                }
                 Err(e) => println!("kumquat: snapshot failed: {:?}", e),
             }
         }
         if RESTORE_REQUESTED.swap(false, Ordering::SeqCst) {
             println!("kumquat: restore requested");
             let dir = kumquat_gpu_snapshot_dir();
+            let _ = std::fs::remove_file(restore_complete_marker());
             match kumquat.rutabaga_restore(std::path::Path::new(&dir)) {
-                Ok(()) => println!("kumquat: restore done from {}", dir),
+                Ok(()) => {
+                    if let Err(e) = std::fs::write(restore_complete_marker(), b"ok") {
+                        println!("kumquat: restore marker write failed: {e:?}");
+                    }
+                    println!("kumquat: restore done from {}", dir);
+                }
                 Err(e) => println!("kumquat: restore failed: {:?}", e),
             }
         }
@@ -102,4 +116,15 @@ fn main() -> KumquatGpuResult<()> {
 
 fn kumquat_gpu_snapshot_dir() -> String {
     "/tmp/kumquat-snapshot".to_string()
+}
+
+/// Written after a snapshot/restore finished; valo polls for these instead of
+/// resuming the guest on a guessed delay. Must stay in sync with
+/// valo's `crates/valo/src/checkpoint/gpu.rs`.
+fn snapshot_complete_marker() -> String {
+    "/tmp/kumquat-snapshot/.snapshot-complete".to_string()
+}
+
+fn restore_complete_marker() -> String {
+    "/tmp/kumquat-snapshot/.restore-complete".to_string()
 }
