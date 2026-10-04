@@ -14,12 +14,20 @@ use std::sync::Mutex;
 use log::error;
 use magma_gpu::protocols::ipc::KumquatStream;
 use magma_gpu::protocols::kumquat_gpu_protocol::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use magma_gpu::util::create_event_pair;
+
+/// Number of completed GPU snapshots. A resource with
+/// `created_epoch == SNAPSHOT_EPOCH` was created after the last snapshot and
+/// belongs to no restore point yet. Detector only — nothing here changes
+/// restore behavior.
+static SNAPSHOT_EPOCH: AtomicU64 = AtomicU64::new(0);
 use magma_gpu::util::AsBorrowedDescriptor;
 use magma_gpu::util::AsRawDescriptor;
-use magma_gpu::util::FromRawDescriptor;
 use magma_gpu::util::Error as MagmaGpuError;
 use magma_gpu::util::EventSignaler;
+use magma_gpu::util::FromRawDescriptor;
 use magma_gpu::util::Handle as MagmaGpuHandle;
 use magma_gpu::util::MemoryMapping;
 use magma_gpu::util::OwnedDescriptor;
@@ -38,10 +46,10 @@ use rutabaga_gfx::RutabagaFence;
 use rutabaga_gfx::RutabagaFenceHandler;
 use rutabaga_gfx::RutabagaHandle;
 use rutabaga_gfx::RutabagaIovec;
-use rutabaga_gfx::RUTABAGA_BLOB_MEM_GUEST;
 use rutabaga_gfx::RutabagaWsi;
 use rutabaga_gfx::Transfer3D;
 use rutabaga_gfx::VulkanInfo as RutabagaVulkanInfo;
+use rutabaga_gfx::RUTABAGA_BLOB_MEM_GUEST;
 use rutabaga_gfx::RUTABAGA_FLAG_FENCE;
 use rutabaga_gfx::RUTABAGA_FLAG_FENCE_HOST_SHAREABLE;
 use rutabaga_gfx::RUTABAGA_MAP_ACCESS_RW;
@@ -240,6 +248,9 @@ pub struct KumquatGpuResource {
     attached_contexts: Set<u32>,
     mapping: Option<MemoryMapping>,
     exported: Option<ExportedBlob>,
+    /// Snapshot generation the resource was created in. Used by the restore
+    /// re-attach logging to spot resources from the discarded timeline.
+    created_epoch: u64,
 }
 
 pub struct FenceData {
@@ -461,6 +472,7 @@ impl KumquatGpuConnection {
                             attached_contexts: Default::default(),
                             mapping: Some(mapping),
                             exported: None,
+                            created_epoch: SNAPSHOT_EPOCH.load(Ordering::SeqCst),
                         },
                     );
 
@@ -677,6 +689,7 @@ impl KumquatGpuConnection {
                             attached_contexts: Set::from([cmd.ctx_id]),
                             mapping,
                             exported,
+                            created_epoch: SNAPSHOT_EPOCH.load(Ordering::SeqCst),
                         },
                     );
 
@@ -746,17 +759,44 @@ impl AsBorrowedDescriptor for KumquatGpuConnection {
 }
 
 impl KumquatGpu {
-    pub fn rutabaga_snapshot(&self, directory: &std::path::Path) -> KumquatGpuResult<()> {
+    pub fn rutabaga_snapshot(&mut self, directory: &std::path::Path) -> KumquatGpuResult<()> {
+        let epoch = SNAPSHOT_EPOCH.load(Ordering::SeqCst);
+        eprintln!(
+            "kumquat: [detect] snapshot begin epoch {epoch}, {} resources live",
+            self.resources.len()
+        );
         self.rutabaga.snapshot(directory)?;
+        // Everything created from now on belongs to the next era.
+        SNAPSHOT_EPOCH.fetch_add(1, Ordering::SeqCst);
+        eprintln!(
+            "kumquat: [detect] snapshot done, next epoch {}",
+            SNAPSHOT_EPOCH.load(Ordering::SeqCst)
+        );
         Ok(())
     }
 
     pub fn rutabaga_restore(&mut self, directory: &std::path::Path) -> KumquatGpuResult<()> {
+        let epoch = SNAPSHOT_EPOCH.load(Ordering::SeqCst);
+        let post_checkpoint: Vec<u32> = self
+            .resources
+            .iter()
+            .filter(|(_, r)| r.created_epoch >= epoch)
+            .map(|(id, _)| *id)
+            .collect();
+        if !post_checkpoint.is_empty() {
+            eprintln!(
+                "kumquat: [detect] restore against epoch {epoch}: {} resource(s) created AFTER the last snapshot: {:?} — these do not exist at the restore point",
+                post_checkpoint.len(),
+                post_checkpoint
+            );
+        }
         // Re-attach the client-visible blob mappings (e.g. the ASG ring the
         // client keeps mapping) BEFORE the restore: the gfxstream frontend
         // consumes the registered mappings while recreating the resources.
         for (resource_id, res) in self.resources.iter_mut() {
-            let Some(exported) = &mut res.exported else { continue };
+            let Some(exported) = &mut res.exported else {
+                continue;
+            };
             // Re-register a fresh dup of the dma-buf descriptor on every
             // restore: the replayed vkAllocateMemory consumes it each time.
             if let Some(dma_buf) = &exported.dma_buf {
@@ -774,6 +814,17 @@ impl KumquatGpu {
                 let Ok(clone) = exported.descriptor.try_clone() else {
                     continue;
                 };
+                let clone_fd = clone.as_raw_descriptor();
+                let clone_flags = unsafe { libc::fcntl(clone_fd, libc::F_GETFL) };
+                // Capture identity NOW: from_safe_descriptor consumes (and on
+                // failure closes) the descriptor, so /proc reads must happen
+                // before the mmap attempt.
+                let fd_kind = std::fs::read_link(format!("/proc/self/fd/{clone_fd}"))
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|e| format!("readlink failed: {e}"));
+                let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{clone_fd}"))
+                    .map(|s| s.lines().take(6).collect::<Vec<_>>().join("; "))
+                    .unwrap_or_else(|e| format!("fdinfo failed: {e}"));
                 match MemoryMapping::from_safe_descriptor(
                     clone,
                     exported.size as usize,
@@ -782,13 +833,33 @@ impl KumquatGpu {
                     Ok(mapping) => {
                         let raw = mapping.as_raw_mapping();
                         eprintln!(
-                            "kumquat: reattach resource {resource_id} ctx {} blob {} at {:#x}",
+                            "kumquat: reattach resource {resource_id} ctx {} blob {} at {:#x} (fd {clone_fd} flags {clone_flags:#x})",
                             exported.ctx_id, exported.blob_id, raw.ptr
                         );
                         exported.mapping = Some(mapping);
                     }
                     Err(e) => {
-                        eprintln!("kumquat: re-attach mapping failed: {e:?}");
+                        // TODO: hack
+                        // mmap gives EPERM for PROT_WRITE on an O_RDONLY fd —
+                        // log the fd access mode so RO descriptors are visible.
+                        if format!("{e:?}").contains("PermissionDenied")
+                            && fd_kind.contains("dmabuf")
+                        {
+                            // The kernel refuses CPU mappings for VRAM-only
+                            // images (e.g. swapchain dma-bufs). These blobs
+                            // never had a host-side mapping on the normal
+                            // path; the descriptor re-registration above is
+                            // what the replay needs. Verified benign.
+                            eprintln!(
+                                "kumquat: blob {blob} (resource {resource_id}) not CPU-mappable ({fd_kind}) — descriptor re-registered, no host mapping needed",
+                                blob = exported.blob_id
+                            );
+                        } else {
+                            eprintln!(
+                                "kumquat: re-attach mapping failed for resource {resource_id} ctx {} blob {}: {e} fd={clone_fd} flags={clone_flags:#x} kind={fd_kind} fdinfo=[{fdinfo}]",
+                                exported.ctx_id, exported.blob_id,
+                            );
+                        }
                         continue;
                     }
                 }
@@ -823,7 +894,9 @@ impl KumquatGpu {
                     len: raw.size as usize,
                 }];
                 if let Err(e) = self.rutabaga.attach_backing(*resource_id, vecs) {
-                    eprintln!("kumquat: re-attach backing for resource {resource_id} failed: {e:?}");
+                    eprintln!(
+                        "kumquat: re-attach backing for resource {resource_id} failed: {e:?}"
+                    );
                 }
             }
         }
