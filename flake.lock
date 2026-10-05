@@ -1,0 +1,46 @@
+{
+  "nodes": {
+    "gfxstream": {
+      "inputs": {
+        "nixpkgs": "nixpkgs"
+      },
+      "locked": {
+        "lastModified": 1791283777,
+        "narHash": "sha256-kKN7Bb2XPyX/3b75PwBKcHWuWBfnmw1E0O9ubDPZlHU=",
+        "path": "/home/sipgatejj/.personal/rust/gpu/gfxstream",
+        "type": "path"
+      },
+      "original": {
+        "path": "/home/sipgatejj/.personal/rust/gpu/gfxstream",
+        "type": "path"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1791097562,
+        "narHash": "sha256-K9O9lG3UZNFCnwrz0ViWgP3Kgqukg1DvvzsrkFJfcvU=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "a322c65bf7233456788a9ebf03bc067db7dc090a",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixpkgs-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "gfxstream": "gfxstream",
+        "nixpkgs": [
+          "gfxstream",
+          "nixpkgs"
+        ]
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

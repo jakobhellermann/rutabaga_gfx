@@ -7,3 +7,4 @@ Cargo.lock
 subprojects/*
 !subprojects/*.wrap
 !subprojects/packagefiles
+/result*
