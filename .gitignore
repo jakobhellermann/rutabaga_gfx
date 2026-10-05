@@ -3,7 +3,7 @@ kumquat/server/target/
 ffi/target/
 third_party/mesa3d/src/util/rust/target
 third_party/mesa3d/src/virtio/protocols/target/
-Cargo.lock
 subprojects/*
 !subprojects/*.wrap
 !subprojects/packagefiles
+/result*
