@@ -462,7 +462,7 @@ impl Gfxstream {
             },
             stream_renderer_param {
                 key: STREAM_RENDERER_PARAM_FENCE_CALLBACK,
-                value: write_context_fence as usize as u64,
+                value: write_context_fence as *const () as u64,
             },
             stream_renderer_param {
                 key: STREAM_RENDERER_PARAM_WIN0_WIDTH,
@@ -477,7 +477,7 @@ impl Gfxstream {
         if use_debug {
             stream_renderer_params.push(stream_renderer_param {
                 key: STREAM_RENDERER_PARAM_DEBUG_CALLBACK,
-                value: gfxstream_debug_callback as usize as u64,
+                value: gfxstream_debug_callback as *const () as u64,
             });
         }
 

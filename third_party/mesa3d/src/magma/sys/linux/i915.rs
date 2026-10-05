@@ -130,10 +130,8 @@ where
         .saturating_sub(header_size)
         .div_ceil(element_size);
 
-    let mut query_data = T::new_box_zeroed_with_elems(count)
+    let query_data = T::new_box_zeroed_with_elems(count)
         .map_err(|_| MagmaGpuError::WithContext("Failed to allocate query data"))?;
-
-    item.data_ptr = &mut *query_data as *mut T as *mut () as u64;
 
     // SAFETY: Second call to get the data
     unsafe {
