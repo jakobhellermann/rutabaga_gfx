@@ -251,6 +251,12 @@ pub struct KumquatGpuResource {
     /// Snapshot generation the resource was created in. Used by the restore
     /// re-attach logging to spot resources from the discarded timeline.
     created_epoch: u64,
+    /// Backed by `create_guest_blob_backing` memfd memory that the guest has
+    /// mapped (the `/memfd:kumquat-guest-blob` areas). The restore write
+    /// guard mprotects these mappings read-only: any write from this process
+    /// during a restore corrupts the checkpoint state the guest is about to
+    /// be resumed with.
+    guest_blob: bool,
 }
 
 pub struct FenceData {
@@ -522,6 +528,7 @@ impl KumquatGpuConnection {
                             mapping: Some(mapping),
                             exported: None,
                             created_epoch: SNAPSHOT_EPOCH.load(Ordering::SeqCst),
+                            guest_blob: false,
                         },
                     );
 
@@ -673,6 +680,7 @@ impl KumquatGpuConnection {
                         None
                     };
 
+                    let guest_blob = backing.is_some();
                     let (iovecs, handle, response_handle, mapping, dma_buf_dup) = match backing {
                         Some(GuestBlobBacking {
                             mapping,
@@ -739,6 +747,7 @@ impl KumquatGpuConnection {
                             mapping,
                             exported,
                             created_epoch: SNAPSHOT_EPOCH.load(Ordering::SeqCst),
+                            guest_blob,
                         },
                     );
 
@@ -944,7 +953,78 @@ impl KumquatGpu {
             );
         }
 
-        self.rutabaga.restore(directory)?;
+        // Write guard: GUEST blob memory is guest-owned snapshot state. While
+        // the restore replays, the only legal writer is valo's CPU restore
+        // through its own mapping (the guest itself is frozen). Any write from
+        // THIS process would silently corrupt what the guest resumes with — so
+        // fail loudly instead: mprotect our mappings of guest blob memory
+        // read-only for the duration of the replay, letting an offending write
+        // SIGSEGV at the culprit with a backtrace. The ring mappings are NOT
+        // guarded: the ASG host legitimately writes ring state during restore
+        // (value-equal to the checkpoint content). Writes through separate
+        // host-driver mappings of the dma-buf are NOT covered by this guard.
+        let mut guarded: Vec<(usize, usize)> = Vec::new();
+        for res in self.resources.values() {
+            if !res.guest_blob {
+                continue;
+            }
+            if let Some(mapping) = &res.mapping {
+                let raw = mapping.as_raw_mapping();
+                guarded.push((raw.ptr as usize, raw.size as usize));
+            }
+            if let Some(exported) = &res.exported {
+                if let Some(mapping) = &exported.mapping {
+                    let raw = mapping.as_raw_mapping();
+                    guarded.push((raw.ptr as usize, raw.size as usize));
+                }
+            }
+        }
+        for (ptr, size) in &guarded {
+            let ret = unsafe {
+                libc::mprotect(
+                    (*ptr) as *mut c_void,
+                    *size,
+                    libc::PROT_READ,
+                )
+            };
+            if ret != 0 {
+                return Err(
+                    MagmaGpuError::IoError(std::io::Error::last_os_error()).into(),
+                );
+            }
+        }
+        // Self-test for the write guard (see comment above): deliberately
+        // write into the first guarded mapping to prove the guard crashes
+        // loudly instead of corrupting silently. Only with
+        // KUMQUAT_WRITE_GUARD_PROBE=1.
+        if !guarded.is_empty()
+            && std::env::var("KUMQUAT_WRITE_GUARD_PROBE")
+                .map(|v| !matches!(v.as_str(), "" | "0" | "false" | "no"))
+                .unwrap_or(false)
+        {
+            let (ptr, _size) = guarded[0];
+            eprintln!("kumquat: write guard probe: writing to {ptr:#x}");
+            // SAFETY: deliberate write into the guarded mapping.
+            unsafe { std::ptr::write_volatile(ptr as *mut u8, 0x42) };
+            eprintln!("kumquat: write guard probe: write did NOT crash — guard is broken!");
+        }
+        let restore_result = self.rutabaga.restore(directory);
+        for (ptr, size) in &guarded {
+            // SAFETY: same address/size that were mprotected above; restoring
+            // the original read/write access unconditionally, also on error.
+            let ret = unsafe {
+                libc::mprotect(
+                    (*ptr) as *mut c_void,
+                    *size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            };
+            if ret != 0 {
+                eprintln!("kumquat: write guard: mprotect RW failed at {ptr:#x}: {}",
+                    std::io::Error::last_os_error());
+            }
+        }
+        restore_result?;
         self.reattach_backings();
         Ok(())
     }
