@@ -8,20 +8,9 @@ mod kumquat_gpu;
 use std::io::Write;
 use std::os::fd::FromRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-static SNAPSHOT_REQUESTED: AtomicBool = AtomicBool::new(false);
-static RESTORE_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn on_sigusr1(_: libc::c_int) {
-    SNAPSHOT_REQUESTED.store(true, Ordering::SeqCst);
-}
-
-extern "C" fn on_sigusr2(_: libc::c_int) {
-    RESTORE_REQUESTED.store(true, Ordering::SeqCst);
-}
 
 use clap::Parser;
+use kumquat::GpuRequest;
 use kumquat::KumquatBuilder;
 use magma_gpu::util::FromRawDescriptor;
 use magma_gpu::util::IntoRawDescriptor;
@@ -58,6 +47,32 @@ struct Args {
     snapshot_dir: PathBuf,
 }
 
+/// Block the GPU request signals and return a nonblocking signalfd reporting
+/// them. Blocking is required for signalfd delivery and replaces the default
+/// disposition (terminate); threads spawned later inherit the mask.
+fn create_signal_fd() -> std::result::Result<OwnedDescriptor, magma_gpu::util::Error> {
+    // SAFETY: the sigset calls only mutate the local set; signalfd returns a
+    // fresh descriptor owned from here on.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGUSR1);
+        libc::sigaddset(&mut set, libc::SIGUSR2);
+        if libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) != 0 {
+            return Err(magma_gpu::util::Error::IoError(
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let fd = libc::signalfd(-1, &set, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK);
+        if fd < 0 {
+            return Err(magma_gpu::util::Error::IoError(
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(OwnedDescriptor::from_raw_descriptor(fd))
+    }
+}
+
 fn main() -> KumquatGpuResult<()> {
     let args = Args::parse();
 
@@ -68,15 +83,14 @@ fn main() -> KumquatGpuResult<()> {
     // SAFETY: single-threaded startup, no other threads read the environment.
     unsafe { std::env::set_var("ANDROID_GFXSTREAM_CAPTURE_VK_SNAPSHOT", "1") };
 
-    unsafe {
-        libc::signal(libc::SIGUSR1, on_sigusr1 as *const () as usize);
-        libc::signal(libc::SIGUSR2, on_sigusr2 as *const () as usize);
-    }
+    // Must run before the renderer spawns threads: they inherit the mask.
+    let signal_fd = create_signal_fd()?;
 
     let mut kumquat = KumquatBuilder::new()
         .set_capset_names(args.capset_names)
         .set_gpu_socket((!args.gpu_socket_path.is_empty()).then_some(args.gpu_socket_path))
         .set_renderer_features(args.renderer_features)
+        .set_signal_fd(signal_fd)
         .build()?;
 
     if args.pipe_descriptor != 0 {
@@ -95,31 +109,46 @@ fn main() -> KumquatGpuResult<()> {
     });
 
     loop {
-        if SNAPSHOT_REQUESTED.swap(false, Ordering::SeqCst) {
-            println!("kumquat: snapshot requested");
-            let result = std::fs::create_dir_all(&args.snapshot_dir)
-                .map_err(magma_gpu::util::Error::IoError)
-                .map_err(Into::into)
-                .and_then(|()| kumquat.rutabaga_snapshot(&args.snapshot_dir));
+        kumquat.run()?;
+        while let Some(request) = kumquat.take_gpu_request() {
+            let (result, ok_byte, err_byte) = match request {
+                GpuRequest::Snapshot => {
+                    println!("kumquat: snapshot requested");
+                    (
+                        std::fs::create_dir_all(&args.snapshot_dir)
+                            .map_err(magma_gpu::util::Error::IoError)
+                            .map_err(Into::into)
+                            .and_then(|()| kumquat.rutabaga_snapshot(&args.snapshot_dir)),
+                        b'S',
+                        b's',
+                    )
+                }
+                GpuRequest::Restore => {
+                    println!("kumquat: restore requested");
+                    (kumquat.rutabaga_restore(&args.snapshot_dir), b'R', b'r')
+                }
+            };
             match &result {
                 Ok(()) => println!(
-                    "kumquat: snapshot written to {}",
+                    "kumquat: {} done from {}",
+                    match request {
+                        GpuRequest::Snapshot => "snapshot",
+                        GpuRequest::Restore => "restore",
+                    },
                     args.snapshot_dir.display()
                 ),
-                Err(e) => eprintln!("kumquat: snapshot failed: {e:?}"),
+                Err(e) => eprintln!("kumquat: {} failed: {e:?}", {
+                    match request {
+                        GpuRequest::Snapshot => "snapshot",
+                        GpuRequest::Restore => "restore",
+                    }
+                }),
             };
-            send_result(&mut result_pipe, if result.is_ok() { b'S' } else { b's' })?;
+            send_result(
+                &mut result_pipe,
+                if result.is_ok() { ok_byte } else { err_byte },
+            )?;
         }
-        if RESTORE_REQUESTED.swap(false, Ordering::SeqCst) {
-            println!("kumquat: restore requested");
-            let result = kumquat.rutabaga_restore(&args.snapshot_dir);
-            match &result {
-                Ok(()) => println!("kumquat: restore done from {}", args.snapshot_dir.display()),
-                Err(e) => eprintln!("kumquat: restore failed: {e:?}"),
-            };
-            send_result(&mut result_pipe, if result.is_ok() { b'R' } else { b'r' })?;
-        }
-        kumquat.run()?;
     }
 }
 
