@@ -24,11 +24,13 @@ enum KumquatConnection {
     GpuConnection(Box<KumquatGpuConnection>),
 }
 
-/// Snapshot or restore request delivered over the blocked SIGUSR1/2 signalfd.
+/// Snapshot or restore request delivered over the blocked SIGUSR1/2
+/// signalfd. The requested savestate slot travels in the signal's `sigqueue`
+/// value (`signalfd_siginfo.ssi_int`); a plain `kill()` leaves it at 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuRequest {
-    Snapshot,
-    Restore,
+    Snapshot(u32),
+    Restore(u32),
 }
 
 /// Reserved wait-context id for the signalfd; connection ids never reach it.
@@ -45,16 +47,24 @@ pub struct Kumquat {
 }
 
 impl Kumquat {
-    pub fn rutabaga_snapshot(&mut self, directory: &std::path::Path) -> KumquatGpuResult<()> {
+    pub fn rutabaga_snapshot(
+        &mut self,
+        directory: &std::path::Path,
+        slot: u32,
+    ) -> KumquatGpuResult<()> {
         if let Some(gpu) = &mut self.kumquat_gpu_opt {
-            gpu.rutabaga_snapshot(directory)?;
+            gpu.rutabaga_snapshot(directory, slot)?;
         }
         Ok(())
     }
 
-    pub fn rutabaga_restore(&mut self, directory: &std::path::Path) -> KumquatGpuResult<()> {
+    pub fn rutabaga_restore(
+        &mut self,
+        directory: &std::path::Path,
+        slot: u32,
+    ) -> KumquatGpuResult<()> {
         if let Some(gpu) = &mut self.kumquat_gpu_opt {
-            gpu.rutabaga_restore(directory)?;
+            gpu.rutabaga_restore(directory, slot)?;
         }
         Ok(())
     }
@@ -77,9 +87,11 @@ impl Kumquat {
                 )
             };
             if read == size as isize {
+                // The slot as sent via sigqueue's sigval; plain kill() reads 0.
+                let slot = info.ssi_int as u32;
                 let request = match i32::try_from(info.ssi_signo).ok() {
-                    Some(libc::SIGUSR1) => GpuRequest::Snapshot,
-                    Some(libc::SIGUSR2) => GpuRequest::Restore,
+                    Some(libc::SIGUSR1) => GpuRequest::Snapshot(slot),
+                    Some(libc::SIGUSR2) => GpuRequest::Restore(slot),
                     _ => continue,
                 };
                 // Blocked standard signals coalesce, so the queue holds at
@@ -118,7 +130,9 @@ impl Kumquat {
                         KumquatConnection::GpuListener => {
                             if let Some(ref listener) = self.gpu_listener_opt {
                                 // A failed accept is transient — skip it, keep serving.
-                                let Ok(stream) = listener.accept() else { continue };
+                                let Ok(stream) = listener.accept() else {
+                                    continue;
+                                };
                                 self.connection_id += 1;
                                 let new_gpu_conn = KumquatGpuConnection::new(stream);
                                 self.wait_ctx.add(
@@ -139,9 +153,7 @@ impl Kumquat {
                                     hung_up = match gpu_conn.process_command(kumquat_gpu) {
                                         Ok(processed) => !processed && event.hung_up,
                                         Err(e) => {
-                                            eprintln!(
-                                                "kumquat: client connection error: {e}"
-                                            );
+                                            eprintln!("kumquat: client connection error: {e}");
                                             true
                                         }
                                     };
