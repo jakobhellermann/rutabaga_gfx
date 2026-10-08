@@ -17,6 +17,7 @@ use magma_gpu::util::IntoRawDescriptor;
 use magma_gpu::util::OwnedDescriptor;
 use magma_gpu::util::WritePipe;
 
+use crate::kumquat_gpu::KumquatGpuError;
 use crate::kumquat_gpu::KumquatGpuResult;
 
 #[derive(Parser, Debug)]
@@ -45,6 +46,12 @@ struct Args {
 
     #[arg(long, default_value = "/tmp/kumquat-snapshot")]
     snapshot_dir: PathBuf,
+
+    /// Base directory for savestate slots: slot N snapshots into
+    /// `<base>/<N>/gpu`. When set it replaces the single-shot
+    /// `--snapshot-dir`, which only serves slot 0 (legacy/manual runs).
+    #[arg(long)]
+    snapshot_base: Option<PathBuf>,
 }
 
 /// Block the GPU request signals and return a nonblocking signalfd reporting
@@ -111,38 +118,40 @@ fn main() -> KumquatGpuResult<()> {
     loop {
         kumquat.run()?;
         while let Some(request) = kumquat.take_gpu_request() {
+            let (op, slot) = match request {
+                GpuRequest::Snapshot(slot) => ("snapshot", slot),
+                GpuRequest::Restore(slot) => ("restore", slot),
+            };
+            println!("kumquat: {op} requested (slot {slot})");
             let (result, ok_byte, err_byte) = match request {
-                GpuRequest::Snapshot => {
-                    println!("kumquat: snapshot requested");
-                    (
-                        std::fs::create_dir_all(&args.snapshot_dir)
-                            .map_err(magma_gpu::util::Error::IoError)
-                            .map_err(Into::into)
-                            .and_then(|()| kumquat.rutabaga_snapshot(&args.snapshot_dir)),
-                        b'S',
-                        b's',
+                GpuRequest::Snapshot(slot) => (
+                    slot_directory(args.snapshot_base.as_deref(), &args.snapshot_dir, slot)
+                        .and_then(|dir| {
+                            std::fs::create_dir_all(&dir)
+                                .map_err(magma_gpu::util::Error::IoError)
+                                .map_err(Into::into)
+                                .and_then(|()| kumquat.rutabaga_snapshot(&dir, slot))
+                        }),
+                    b'S',
+                    b's',
+                ),
+                GpuRequest::Restore(slot) => (
+                    slot_directory(args.snapshot_base.as_deref(), &args.snapshot_dir, slot)
+                        .and_then(|dir| kumquat.rutabaga_restore(&dir, slot)),
+                    b'R',
+                    b'r',
+                ),
+            };
+            let dir = slot_directory(args.snapshot_base.as_deref(), &args.snapshot_dir, slot)
+                .map(|d| d.display().to_string());
+            match &result {
+                Ok(()) => {
+                    println!(
+                        "kumquat: {op} (slot {slot}) done from {}",
+                        dir.unwrap_or_default()
                     )
                 }
-                GpuRequest::Restore => {
-                    println!("kumquat: restore requested");
-                    (kumquat.rutabaga_restore(&args.snapshot_dir), b'R', b'r')
-                }
-            };
-            match &result {
-                Ok(()) => println!(
-                    "kumquat: {} done from {}",
-                    match request {
-                        GpuRequest::Snapshot => "snapshot",
-                        GpuRequest::Restore => "restore",
-                    },
-                    args.snapshot_dir.display()
-                ),
-                Err(e) => eprintln!("kumquat: {} failed: {e:?}", {
-                    match request {
-                        GpuRequest::Snapshot => "snapshot",
-                        GpuRequest::Restore => "restore",
-                    }
-                }),
+                Err(e) => eprintln!("kumquat: {op} (slot {slot}) failed: {e:?}"),
             };
             send_result(
                 &mut result_pipe,
@@ -158,4 +167,24 @@ fn send_result(pipe: &mut Option<std::fs::File>, status: u8) -> KumquatGpuResult
             .map_err(magma_gpu::util::Error::IoError)?;
     }
     Ok(())
+}
+
+/// Resolve the snapshot directory for a slot request. With
+/// `--snapshot-base` every slot lives in `<base>/<slot>/gpu` (valo's
+/// `$VALO_HOME/slots` layout); the legacy `--snapshot-dir` only serves
+/// slot 0. Takes the fields disjointly instead of `&Args` because the
+/// builder moves `args.renderer_features`.
+fn slot_directory(
+    snapshot_base: Option<&std::path::Path>,
+    snapshot_dir: &std::path::Path,
+    slot: u32,
+) -> KumquatGpuResult<PathBuf> {
+    match snapshot_base {
+        Some(base) => Ok(base.join(slot.to_string()).join("gpu")),
+        None if slot == 0 => Ok(snapshot_dir.to_path_buf()),
+        None => Err(KumquatGpuError::SnapshotError(format!(
+            "slot {slot} requested without --snapshot-base \
+             (legacy --snapshot-dir only serves slot 0)"
+        ))),
+    }
 }

@@ -19,9 +19,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use magma_gpu::util::create_event_pair;
 
 /// Number of completed GPU snapshots. A resource with
-/// `created_epoch == SNAPSHOT_EPOCH` was created after the last snapshot and
-/// belongs to no restore point yet. Snapshot resources detached later are
-/// archived until the next restore so their host descriptors stay available.
+/// `created_epoch == SNAPSHOT_EPOCH` was created after the most recent
+/// snapshot and belongs to no restore point yet. Each slot records the era of
+/// its own snapshot in `SlotSnapshotState::epoch`; the restore-time
+/// post-checkpoint diagnostics compare resources against that.
 static SNAPSHOT_EPOCH: AtomicU64 = AtomicU64::new(0);
 use magma_gpu::util::AsBorrowedDescriptor;
 use magma_gpu::util::AsRawDescriptor;
@@ -207,6 +208,8 @@ pub enum KumquatGpuError {
     MagmaGpuError(MagmaGpuError),
     #[error("Rutabaga Error {0}")]
     RutabagaError(RutabagaError),
+    #[error("Snapshot Error {0}")]
+    SnapshotError(String),
 }
 
 impl From<MagmaGpuError> for KumquatGpuError {
@@ -240,13 +243,17 @@ struct ExportedBlob {
     /// replayed vkAllocateMemory can import it again.
     dma_buf: Option<OwnedDescriptor>,
     /// Mapping of `descriptor`, created at re-attach time and kept alive for
-    /// as long as the gfxstream resource uses the address.
-    mapping: Option<MemoryMapping>,
+    /// as long as the gfxstream resource uses the address. Shared: slot
+    /// archives hold `Arc` clones so the mapping outlives any one archive.
+    mapping: Option<Arc<MemoryMapping>>,
 }
 
 pub struct KumquatGpuResource {
     attached_contexts: Set<u32>,
-    mapping: Option<MemoryMapping>,
+    /// SHM backing mapping (3D resources). Shared with slot archives via
+    /// `Arc`: archiving duplicates the resource per slot, but the mapping
+    /// must stay alive exactly once (RAII munmap on the last reference).
+    mapping: Option<Arc<MemoryMapping>>,
     exported: Option<ExportedBlob>,
     /// Snapshot generation the resource was created in. Used by the restore
     /// re-attach logging to spot resources from the discarded timeline.
@@ -257,6 +264,42 @@ pub struct KumquatGpuResource {
     /// during a restore corrupts the checkpoint state the guest is about to
     /// be resumed with.
     guest_blob: bool,
+}
+
+impl KumquatGpuResource {
+    /// Duplicate the resource for a slot archive: mappings are shared via
+    /// `Arc` (the original is dropped by the caller), descriptors are fresh
+    /// dups, `attached_contexts` is overwritten by the caller from the slot's
+    /// snapshot bookkeeping.
+    fn try_clone_for_archive(&self) -> KumquatGpuResult<KumquatGpuResource> {
+        Ok(KumquatGpuResource {
+            attached_contexts: self.attached_contexts.clone(),
+            mapping: self.mapping.clone(),
+            exported: self
+                .exported
+                .as_ref()
+                .map(|exported| -> KumquatGpuResult<ExportedBlob> {
+                    Ok(ExportedBlob {
+                        ctx_id: exported.ctx_id,
+                        blob_id: exported.blob_id,
+                        size: exported.size,
+                        descriptor: exported
+                            .descriptor
+                            .try_clone()
+                            .map_err(MagmaGpuError::IoError)?,
+                        dma_buf: exported
+                            .dma_buf
+                            .as_ref()
+                            .map(|d| d.try_clone().map_err(MagmaGpuError::IoError))
+                            .transpose()?,
+                        mapping: exported.mapping.clone(),
+                    })
+                })
+                .transpose()?,
+            created_epoch: self.created_epoch,
+            guest_blob: self.guest_blob,
+        })
+    }
 }
 
 pub struct FenceData {
@@ -281,15 +324,26 @@ pub fn create_fence_handler(fence_state: FenceState) -> RutabagaFenceHandler {
     })
 }
 
+/// Host-side bookkeeping of one savestate slot's last snapshot.
+#[derive(Default)]
+struct SlotSnapshotState {
+    /// Context attachments at this slot's last snapshot.
+    snapshot_contexts: Map<u32, Set<u32>>,
+    /// Snapshot resources unreferenced by the guest since that snapshot;
+    /// kept alive so a restore from this slot can bring them back.
+    archived_resources: Map<u32, KumquatGpuResource>,
+    /// SNAPSHOT_EPOCH of the era this slot's snapshot opens: resources with
+    /// `created_epoch >= epoch` postdate the snapshot (diagnostics).
+    epoch: u64,
+}
+
 pub struct KumquatGpu {
     rutabaga: Rutabaga,
     fence_state: FenceState,
     id_allocator: u32,
     resources: Map<u32, KumquatGpuResource>,
-    /// Context attachments at the last GPU snapshot.
-    snapshot_contexts: Map<u32, Set<u32>>,
-    /// Snapshot resources unreferenced by the guest since that snapshot.
-    archived_resources: Map<u32, KumquatGpuResource>,
+    /// Snapshot bookkeeping per savestate slot.
+    slot_states: Map<u32, SlotSnapshotState>,
 }
 
 impl KumquatGpu {
@@ -326,8 +380,7 @@ impl KumquatGpu {
             fence_state,
             id_allocator: 0,
             resources: Default::default(),
-            snapshot_contexts: Default::default(),
-            archived_resources: Default::default(),
+            slot_states: Default::default(),
         })
     }
 
@@ -470,12 +523,19 @@ impl KumquatGpuConnection {
                                 );
                                 error
                             })?;
-                        if let Some(contexts) = kumquat_gpu.snapshot_contexts.get(&cmd.resource_id)
-                        {
-                            resource.attached_contexts = contexts.clone();
-                            kumquat_gpu
-                                .archived_resources
-                                .insert(cmd.resource_id, resource);
+                        // Archive the resource for every slot whose snapshot
+                        // still knows it, so each restore point can bring
+                        // back exactly its own set.
+                        for slot_state in kumquat_gpu.slot_states.values_mut() {
+                            if let Some(contexts) =
+                                slot_state.snapshot_contexts.get(&cmd.resource_id)
+                            {
+                                let mut archived = resource.try_clone_for_archive()?;
+                                archived.attached_contexts = contexts.clone();
+                                slot_state
+                                    .archived_resources
+                                    .insert(cmd.resource_id, archived);
+                            }
                         }
                     } else {
                         kumquat_gpu.resources.insert(cmd.resource_id, resource);
@@ -525,7 +585,7 @@ impl KumquatGpuConnection {
                         resource_id,
                         KumquatGpuResource {
                             attached_contexts: Default::default(),
-                            mapping: Some(mapping),
+                            mapping: Some(Arc::new(mapping)),
                             exported: None,
                             created_epoch: SNAPSHOT_EPOCH.load(Ordering::SeqCst),
                             guest_blob: false,
@@ -744,7 +804,7 @@ impl KumquatGpuConnection {
                         resource_id,
                         KumquatGpuResource {
                             attached_contexts: Set::from([cmd.ctx_id]),
-                            mapping,
+                            mapping: mapping.map(Arc::new),
                             exported,
                             created_epoch: SNAPSHOT_EPOCH.load(Ordering::SeqCst),
                             guest_blob,
@@ -817,30 +877,48 @@ impl AsBorrowedDescriptor for KumquatGpuConnection {
 }
 
 impl KumquatGpu {
-    pub fn rutabaga_snapshot(&mut self, directory: &std::path::Path) -> KumquatGpuResult<()> {
+    pub fn rutabaga_snapshot(
+        &mut self,
+        directory: &std::path::Path,
+        slot: u32,
+    ) -> KumquatGpuResult<()> {
         let epoch = SNAPSHOT_EPOCH.load(Ordering::SeqCst);
         eprintln!(
-            "kumquat: [detect] snapshot begin epoch {epoch}, {} resources live",
+            "kumquat: [detect] snapshot begin (slot {slot}) epoch {epoch}, {} resources live",
             self.resources.len()
         );
         self.rutabaga.snapshot(directory)?;
-        self.snapshot_contexts = self
+        let state = self.slot_states.entry(slot).or_default();
+        state.snapshot_contexts = self
             .resources
             .iter()
             .map(|(id, resource)| (*id, resource.attached_contexts.clone()))
             .collect();
-        self.archived_resources.clear();
-        // Everything created from now on belongs to the next era.
+        // A re-snapshot of this slot supersedes its old archive; other
+        // slots keep theirs.
+        state.archived_resources.clear();
+        // Everything created from now on belongs to a later era than this
+        // slot's snapshot.
         SNAPSHOT_EPOCH.fetch_add(1, Ordering::SeqCst);
+        state.epoch = SNAPSHOT_EPOCH.load(Ordering::SeqCst);
         eprintln!(
-            "kumquat: [detect] snapshot done, next epoch {}",
-            SNAPSHOT_EPOCH.load(Ordering::SeqCst)
+            "kumquat: [detect] snapshot done (slot {slot}), next epoch {}",
+            state.epoch
         );
         Ok(())
     }
 
-    pub fn rutabaga_restore(&mut self, directory: &std::path::Path) -> KumquatGpuResult<()> {
-        let epoch = SNAPSHOT_EPOCH.load(Ordering::SeqCst);
+    pub fn rutabaga_restore(
+        &mut self,
+        directory: &std::path::Path,
+        slot: u32,
+    ) -> KumquatGpuResult<()> {
+        let Some(state) = self.slot_states.get_mut(&slot) else {
+            return Err(KumquatGpuError::SnapshotError(format!(
+                "no snapshot has been taken in slot {slot} this session"
+            )));
+        };
+        let epoch = state.epoch;
         let post_checkpoint: Vec<u32> = self
             .resources
             .iter()
@@ -849,17 +927,17 @@ impl KumquatGpu {
             .collect();
         if !post_checkpoint.is_empty() {
             eprintln!(
-                "kumquat: [detect] restore against epoch {epoch}: {} resource(s) created AFTER the last snapshot: {:?} — these do not exist at the restore point",
+                "kumquat: [detect] restore (slot {slot}) against epoch {epoch}: {} resource(s) created AFTER this slot's snapshot: {:?} — these do not exist at the restore point",
                 post_checkpoint.len(),
                 post_checkpoint
             );
         }
         self.resources
-            .retain(|id, _| self.snapshot_contexts.contains_key(id));
-        for (id, resource) in std::mem::take(&mut self.archived_resources) {
+            .retain(|id, _| state.snapshot_contexts.contains_key(id));
+        for (id, resource) in std::mem::take(&mut state.archived_resources) {
             self.resources.insert(id, resource);
         }
-        for (id, contexts) in &self.snapshot_contexts {
+        for (id, contexts) in &state.snapshot_contexts {
             let resource = self
                 .resources
                 .get_mut(id)
@@ -912,7 +990,7 @@ impl KumquatGpu {
                             "kumquat: reattach resource {resource_id} ctx {} blob {} at {:#x} (fd {clone_fd} flags {clone_flags:#x})",
                             exported.ctx_id, exported.blob_id, raw.ptr
                         );
-                        exported.mapping = Some(mapping);
+                        exported.mapping = Some(Arc::new(mapping));
                     }
                     Err(e) => {
                         // TODO: hack
@@ -980,17 +1058,9 @@ impl KumquatGpu {
             }
         }
         for (ptr, size) in &guarded {
-            let ret = unsafe {
-                libc::mprotect(
-                    (*ptr) as *mut c_void,
-                    *size,
-                    libc::PROT_READ,
-                )
-            };
+            let ret = unsafe { libc::mprotect((*ptr) as *mut c_void, *size, libc::PROT_READ) };
             if ret != 0 {
-                return Err(
-                    MagmaGpuError::IoError(std::io::Error::last_os_error()).into(),
-                );
+                return Err(MagmaGpuError::IoError(std::io::Error::last_os_error()).into());
             }
         }
         // Self-test for the write guard (see comment above): deliberately
@@ -1020,8 +1090,10 @@ impl KumquatGpu {
                 )
             };
             if ret != 0 {
-                eprintln!("kumquat: write guard: mprotect RW failed at {ptr:#x}: {}",
-                    std::io::Error::last_os_error());
+                eprintln!(
+                    "kumquat: write guard: mprotect RW failed at {ptr:#x}: {}",
+                    std::io::Error::last_os_error()
+                );
             }
         }
         restore_result?;
