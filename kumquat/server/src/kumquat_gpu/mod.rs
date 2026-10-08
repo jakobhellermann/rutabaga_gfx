@@ -979,10 +979,20 @@ impl KumquatGpu {
         // consumes the registered mappings while recreating the resources.
         for (resource_id, res) in self.resources.iter_mut() {
             let Some(exported) = &mut res.exported else {
+                eprintln!(
+                    "kumquat: [reattach] resource {resource_id}: no exported blob — skipped"
+                );
                 continue;
             };
             // Re-register a fresh dup of the dma-buf descriptor on every
             // restore: the replayed vkAllocateMemory consumes it each time.
+            eprintln!(
+                "kumquat: [reattach] resource {resource_id} ctx {} blob {}: dma_buf={} mapping={}",
+                exported.ctx_id,
+                exported.blob_id,
+                exported.dma_buf.is_some(),
+                exported.mapping.is_some()
+            );
             if let Some(dma_buf) = &exported.dma_buf {
                 if let Ok(dup) = dma_buf.try_clone() {
                     use magma_gpu::util::IntoRawDescriptor;
