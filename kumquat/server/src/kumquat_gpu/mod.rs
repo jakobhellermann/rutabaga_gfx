@@ -932,17 +932,47 @@ impl KumquatGpu {
                 post_checkpoint
             );
         }
-        self.resources
-            .retain(|id, _| state.snapshot_contexts.contains_key(id));
-        for (id, resource) in std::mem::take(&mut state.archived_resources) {
+        // Split the slot's bookkeeping out (contexts by clone, archives by
+        // value) so the cross-slot archiving below can borrow slot_states.
+        let contexts = state.snapshot_contexts.clone();
+        let archived = std::mem::take(&mut state.archived_resources);
+
+        // Drop the resources this slot does not know. A plain retain would
+        // silently lose them for OTHER slots: a resource created between two
+        // snapshots is referenced by the later slot only, and an earlier
+        // restore's retain removed it without archiving — the later slot's
+        // restore then found its context id missing and failed with
+        // InvalidResourceId. Archive each dropped resource for every slot
+        // whose contexts still know it, exactly like the unref path.
+        let dropped: Vec<u32> = self
+            .resources
+            .keys()
+            .filter(|id| !contexts.contains_key(*id))
+            .copied()
+            .collect();
+        for id in &dropped {
+            let resource = &self.resources[id];
+            for other in self.slot_states.values_mut() {
+                if let Some(other_contexts) = other.snapshot_contexts.get(id) {
+                    let mut copy = resource.try_clone_for_archive()?;
+                    copy.attached_contexts = other_contexts.clone();
+                    other.archived_resources.insert(*id, copy);
+                }
+            }
+        }
+        for id in &dropped {
+            self.resources.remove(id);
+        }
+
+        for (id, resource) in archived {
             self.resources.insert(id, resource);
         }
-        for (id, contexts) in &state.snapshot_contexts {
+        for (id, other_contexts) in &contexts {
             let resource = self
                 .resources
                 .get_mut(id)
                 .ok_or(RutabagaError::InvalidResourceId)?;
-            resource.attached_contexts = contexts.clone();
+            resource.attached_contexts = other_contexts.clone();
         }
         // Re-attach the client-visible blob mappings (e.g. the ASG ring the
         // client keeps mapping) BEFORE the restore: the gfxstream frontend
