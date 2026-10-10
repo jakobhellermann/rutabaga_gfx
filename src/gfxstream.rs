@@ -153,6 +153,9 @@ pub struct stream_renderer_import_data {
 /// transport memory (e.g. the ASG ring the client keeps mapping) instead of
 /// letting the restored resource allocate fresh memory the client cannot see.
 /// The caller keeps `addr` alive for as long as the resource uses it.
+// The raw pointer is handed straight to the C registration; gfxstream never
+// dereferences it on this path, so the missing `unsafe` marker is sound.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn reattach_blob_mapping(ctx_id: u32, blob_id: u32, addr: *mut c_void, caching: u32) {
     // SAFETY: addr is a valid caller-owned mapping; the C function only
     // registers the pointer in the external object manager.
@@ -167,6 +170,15 @@ pub fn reattach_blob_descriptor(ctx_id: u32, blob_id: u64, fd: i32, stream_handl
     // SAFETY: fd is a valid caller-owned descriptor whose ownership moves to
     // gfxstream; the C function only registers it.
     unsafe { stream_renderer_reattach_blob_descriptor(ctx_id, blob_id, fd, stream_handle_type) };
+}
+
+/// Drops every blob descriptor and blob mapping registered with gfxstream's
+/// external object manager, so a restore starts from an empty manager and
+/// only the re-attached registrations of the restore point can be consumed
+/// by the restore replay.
+pub fn clear_external_blob_objects() {
+    // SAFETY: the C function only clears the manager's internal maps.
+    unsafe { stream_renderer_clear_external_blob_objects() };
 }
 
 extern "C" {
@@ -257,6 +269,7 @@ extern "C" {
         fd: i32,
         stream_handle_type: u32,
     );
+    fn stream_renderer_clear_external_blob_objects();
     fn stream_renderer_resource_map(
         res_handle: u32,
         map: *mut *mut c_void,
