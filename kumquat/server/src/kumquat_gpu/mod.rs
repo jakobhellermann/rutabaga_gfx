@@ -242,17 +242,17 @@ struct ExportedBlob {
     /// (GUEST guest-handle blobs only). Re-registered before a restore so the
     /// replayed vkAllocateMemory can import it again.
     dma_buf: Option<OwnedDescriptor>,
-    /// Mapping of `descriptor`, created at re-attach time and kept alive for
-    /// as long as the gfxstream resource uses the address. Shared: slot
-    /// archives hold `Arc` clones so the mapping outlives any one archive.
+    /// Mapping of `descriptor`, shared with the slot table of the restores
+    /// that use it (address-stable across a slot's restores) and kept alive
+    /// for as long as the gfxstream resource uses the address.
     mapping: Option<Arc<MemoryMapping>>,
 }
 
 pub struct KumquatGpuResource {
     attached_contexts: Set<u32>,
-    /// SHM backing mapping (3D resources). Shared with slot archives via
-    /// `Arc`: archiving duplicates the resource per slot, but the mapping
-    /// must stay alive exactly once (RAII munmap on the last reference).
+    /// SHM backing mapping (3D resources and guest blob memory). Shared with
+    /// the slot tables via `Arc`: a slot's table keeps the mapping alive
+    /// across restores of that slot (RAII munmap on the last reference).
     mapping: Option<Arc<MemoryMapping>>,
     exported: Option<ExportedBlob>,
     /// Snapshot generation the resource was created in. Used by the restore
@@ -267,11 +267,78 @@ pub struct KumquatGpuResource {
 }
 
 impl KumquatGpuResource {
-    /// Duplicate the resource for a slot archive: mappings are shared via
-    /// `Arc` (the original is dropped by the caller), descriptors are fresh
-    /// dups, `attached_contexts` is overwritten by the caller from the slot's
-    /// snapshot bookkeeping.
-    fn try_clone_for_archive(&self) -> KumquatGpuResult<KumquatGpuResource> {
+    /// Capture the resource's external state for a slot table: mappings are
+    /// shared via `Arc`, every descriptor is a fresh dup owned by the slot
+    /// table until the slot is re-snapshot.
+    fn snapshot_for_slot(&self) -> KumquatGpuResult<SlotResource> {
+        Ok(SlotResource {
+            attached_contexts: self.attached_contexts.clone(),
+            mapping: self.mapping.clone(),
+            exported: self
+                .exported
+                .as_ref()
+                .map(|exported| -> KumquatGpuResult<SlotExportedBlob> {
+                    Ok(SlotExportedBlob {
+                        ctx_id: exported.ctx_id,
+                        blob_id: exported.blob_id,
+                        size: exported.size,
+                        descriptor: exported
+                            .descriptor
+                            .try_clone()
+                            .map_err(MagmaGpuError::IoError)?,
+                        dma_buf: exported
+                            .dma_buf
+                            .as_ref()
+                            .map(|d| d.try_clone().map_err(MagmaGpuError::IoError))
+                            .transpose()?,
+                        mapping: exported.mapping.clone(),
+                    })
+                })
+                .transpose()?,
+            created_epoch: self.created_epoch,
+            guest_blob: self.guest_blob,
+        })
+    }
+}
+
+/// A slot table's copy of one resource's external state, taken at the
+/// slot's snapshot. Complete and immutable for the slot's lifetime: the
+/// descriptors here are never consumed, restores only clone fresh dups
+/// from them, so a restore never depends on what the live timeline or
+/// another slot's restore did to the resource.
+struct SlotResource {
+    attached_contexts: Set<u32>,
+    mapping: Option<Arc<MemoryMapping>>,
+    exported: Option<SlotExportedBlob>,
+    created_epoch: u64,
+    guest_blob: bool,
+}
+
+/// The fd side of an exported blob as frozen at snapshot time. The host
+/// mapping is derived state, memoized here at the slot's first restore and
+/// re-used (same address) by later restores of the slot: the concurrently
+/// running render thread keeps reading the ring through the mapping wired
+/// by the last restoreAsg, so a restore must never unmap it.
+struct SlotExportedBlob {
+    ctx_id: u32,
+    blob_id: u32,
+    size: u64,
+    descriptor: OwnedDescriptor,
+    /// Dup of the dma-buf handed to gfxstream for the host-side import
+    /// (GUEST guest-handle blobs only). Cloned and re-registered at each
+    /// restore so the replayed vkAllocateMemory can import it again.
+    dma_buf: Option<OwnedDescriptor>,
+    /// Host mapping of `descriptor`, shared with the live wrapper of the
+    /// slot's restores.
+    mapping: Option<Arc<MemoryMapping>>,
+}
+
+impl SlotResource {
+    /// Build the live wrapper for a restore: fresh dups of the table's
+    /// descriptors; the host mapping is shared with the table (address-
+    /// stable across the slot's restores) when it exists, and created by
+    /// the restore's re-attach step otherwise.
+    fn to_live_resource(&self) -> KumquatGpuResult<KumquatGpuResource> {
         Ok(KumquatGpuResource {
             attached_contexts: self.attached_contexts.clone(),
             mapping: self.mapping.clone(),
@@ -327,11 +394,10 @@ pub fn create_fence_handler(fence_state: FenceState) -> RutabagaFenceHandler {
 /// Host-side bookkeeping of one savestate slot's last snapshot.
 #[derive(Default)]
 struct SlotSnapshotState {
-    /// Context attachments at this slot's last snapshot.
-    snapshot_contexts: Map<u32, Set<u32>>,
-    /// Snapshot resources unreferenced by the guest since that snapshot;
-    /// kept alive so a restore from this slot can bring them back.
-    archived_resources: Map<u32, KumquatGpuResource>,
+    /// Complete external state of every resource live at the slot's
+    /// snapshot. A restore of the slot rebuilds the live bookkeeping purely
+    /// from this table.
+    resources: Map<u32, SlotResource>,
     /// SNAPSHOT_EPOCH of the era this slot's snapshot opens: resources with
     /// `created_epoch >= epoch` postdate the snapshot (diagnostics).
     epoch: u64,
@@ -523,20 +589,10 @@ impl KumquatGpuConnection {
                                 );
                                 error
                             })?;
-                        // Archive the resource for every slot whose snapshot
-                        // still knows it, so each restore point can bring
-                        // back exactly its own set.
-                        for slot_state in kumquat_gpu.slot_states.values_mut() {
-                            if let Some(contexts) =
-                                slot_state.snapshot_contexts.get(&cmd.resource_id)
-                            {
-                                let mut archived = resource.try_clone_for_archive()?;
-                                archived.attached_contexts = contexts.clone();
-                                slot_state
-                                    .archived_resources
-                                    .insert(cmd.resource_id, archived);
-                            }
-                        }
+                        // The wrapper is dropped here. Every slot table holds
+                        // its own snapshot-time dups of the descriptors, so
+                        // a restore can still bring the resource back — no
+                        // archiving needed at unref time.
                     } else {
                         kumquat_gpu.resources.insert(cmd.resource_id, resource);
                     }
@@ -835,7 +891,9 @@ impl KumquatGpuConnection {
                         .context_attach_resource(cmd.ctx_id, resource_id)?;
                 }
                 KumquatGpuProtocol::SnapshotSave => {
-                    kumquat_gpu.rutabaga.snapshot(Path::new(SNAPSHOT_DIR))?;
+                    // Legacy client-triggered path; bookkept like the
+                    // signalfd trigger, serving slot 0.
+                    kumquat_gpu.rutabaga_snapshot(Path::new(SNAPSHOT_DIR), 0)?;
 
                     let resp = kumquat_gpu_protocol_ctrl_hdr {
                         type_: KUMQUAT_GPU_PROTOCOL_RESP_OK_SNAPSHOT,
@@ -845,9 +903,7 @@ impl KumquatGpuConnection {
                     self.stream.write(KumquatGpuProtocolWrite::Cmd(resp))?;
                 }
                 KumquatGpuProtocol::SnapshotRestore => {
-                    // Re-attach lives in KumquatGpu::rutabaga_restore — the
-                    // SIGUSR2 path bypasses this protocol arm.
-                    kumquat_gpu.rutabaga.restore(Path::new(SNAPSHOT_DIR))?;
+                    kumquat_gpu.rutabaga_restore(Path::new(SNAPSHOT_DIR), 0)?;
 
                     let resp = kumquat_gpu_protocol_ctrl_hdr {
                         type_: KUMQUAT_GPU_PROTOCOL_RESP_OK_SNAPSHOT,
@@ -888,15 +944,20 @@ impl KumquatGpu {
             self.resources.len()
         );
         self.rutabaga.snapshot(directory)?;
-        let state = self.slot_states.entry(slot).or_default();
-        state.snapshot_contexts = self
+        // The slot's complete external-state table: fresh fd dups of every
+        // live resource. A later restore of this slot rebuilds the live
+        // bookkeeping purely from it, regardless of what the live timeline
+        // does to the resources in between.
+        let table: Map<u32, SlotResource> = self
             .resources
             .iter()
-            .map(|(id, resource)| (*id, resource.attached_contexts.clone()))
-            .collect();
-        // A re-snapshot of this slot supersedes its old archive; other
-        // slots keep theirs.
-        state.archived_resources.clear();
+            .map(|(id, resource)| Ok((*id, resource.snapshot_for_slot()?)))
+            .collect::<KumquatGpuResult<_>>()?;
+        let state = self.slot_states.entry(slot).or_default();
+        // Assigning the table drops the previous snapshot's dups; mappings
+        // are shared (Arc), so they outlive the swap while any live wrapper
+        // or table still references them.
+        state.resources = table;
         // Everything created from now on belongs to a later era than this
         // slot's snapshot.
         SNAPSHOT_EPOCH.fetch_add(1, Ordering::SeqCst);
@@ -932,66 +993,38 @@ impl KumquatGpu {
                 post_checkpoint
             );
         }
-        // Split the slot's bookkeeping out (contexts by clone, archives by
-        // value) so the cross-slot archiving below can borrow slot_states.
-        let contexts = state.snapshot_contexts.clone();
-        let archived = std::mem::take(&mut state.archived_resources);
-
-        // Drop the resources this slot does not know. A plain retain would
-        // silently lose them for OTHER slots: a resource created between two
-        // snapshots is referenced by the later slot only, and an earlier
-        // restore's retain removed it without archiving — the later slot's
-        // restore then found its context id missing and failed with
-        // InvalidResourceId. Archive each dropped resource for every slot
-        // whose contexts still know it, exactly like the unref path.
-        let dropped: Vec<u32> = self
+        // Replace the live timeline with the slot's table: the table is
+        // complete for the slot's save point, so the restore carries over
+        // nothing from the live state. A resource unref'd by the guest
+        // since the snapshot comes back from the table's dups; a resource
+        // created since is simply not in it. No restore can lose state for
+        // another slot — each slot owns its own complete table.
+        self.resources = state
             .resources
-            .keys()
-            .filter(|id| !contexts.contains_key(*id))
-            .copied()
-            .collect();
-        for id in &dropped {
-            let resource = &self.resources[id];
-            for other in self.slot_states.values_mut() {
-                if let Some(other_contexts) = other.snapshot_contexts.get(id) {
-                    let mut copy = resource.try_clone_for_archive()?;
-                    copy.attached_contexts = other_contexts.clone();
-                    other.archived_resources.insert(*id, copy);
-                }
-            }
-        }
-        for id in &dropped {
-            self.resources.remove(id);
-        }
+            .iter()
+            .map(|(id, resource)| Ok((*id, resource.to_live_resource()?)))
+            .collect::<KumquatGpuResult<_>>()?;
 
-        for (id, resource) in archived {
-            self.resources.insert(id, resource);
-        }
-        for (id, other_contexts) in &contexts {
-            let resource = self
-                .resources
-                .get_mut(id)
-                .ok_or(RutabagaError::InvalidResourceId)?;
-            resource.attached_contexts = other_contexts.clone();
-        }
+        // Drop blob registrations from diverged timelines: the restore
+        // replay must only consume descriptors and mappings re-attached
+        // from the slot's table. A key missing from the table now fails
+        // loudly in the replay instead of silently importing stale memory.
+        rutabaga_gfx::clear_external_blob_objects();
         // Re-attach the client-visible blob mappings (e.g. the ASG ring the
         // client keeps mapping) BEFORE the restore: the gfxstream frontend
         // consumes the registered mappings while recreating the resources.
         for (resource_id, res) in self.resources.iter_mut() {
             let Some(exported) = &mut res.exported else {
-                eprintln!(
-                    "kumquat: [reattach] resource {resource_id}: no exported blob — skipped"
-                );
+                eprintln!("kumquat: [reattach] resource {resource_id}: no exported blob — skipped");
                 continue;
             };
             // Re-register a fresh dup of the dma-buf descriptor on every
             // restore: the replayed vkAllocateMemory consumes it each time.
             eprintln!(
-                "kumquat: [reattach] resource {resource_id} ctx {} blob {}: dma_buf={} mapping={}",
+                "kumquat: [reattach] resource {resource_id} ctx {} blob {}: dma_buf={}",
                 exported.ctx_id,
                 exported.blob_id,
-                exported.dma_buf.is_some(),
-                exported.mapping.is_some()
+                exported.dma_buf.is_some()
             );
             if let Some(dma_buf) = &exported.dma_buf {
                 if let Ok(dup) = dma_buf.try_clone() {
@@ -1004,63 +1037,86 @@ impl KumquatGpu {
                     );
                 }
             }
-            if exported.mapping.is_none() {
-                let Ok(clone) = exported.descriptor.try_clone() else {
-                    continue;
-                };
-                let clone_fd = clone.as_raw_descriptor();
-                let clone_flags = unsafe { libc::fcntl(clone_fd, libc::F_GETFL) };
-                // Capture identity NOW: from_safe_descriptor consumes (and on
-                // failure closes) the descriptor, so /proc reads must happen
-                // before the mmap attempt.
-                let fd_kind = std::fs::read_link(format!("/proc/self/fd/{clone_fd}"))
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|e| format!("readlink failed: {e}"));
-                let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{clone_fd}"))
-                    .map(|s| s.lines().take(6).collect::<Vec<_>>().join("; "))
-                    .unwrap_or_else(|e| format!("fdinfo failed: {e}"));
-                match MemoryMapping::from_safe_descriptor(
-                    clone,
-                    exported.size as usize,
-                    RUTABAGA_MAP_CACHE_CACHED | RUTABAGA_MAP_ACCESS_RW,
-                ) {
-                    Ok(mapping) => {
-                        let raw = mapping.as_raw_mapping();
-                        eprintln!(
-                            "kumquat: reattach resource {resource_id} ctx {} blob {} at {:#x} (fd {clone_fd} flags {clone_flags:#x})",
-                            exported.ctx_id, exported.blob_id, raw.ptr
-                        );
-                        exported.mapping = Some(Arc::new(mapping));
-                    }
-                    Err(e) => {
-                        // TODO: hack
-                        // mmap gives EPERM for PROT_WRITE on an O_RDONLY fd —
-                        // log the fd access mode so RO descriptors are visible.
-                        if format!("{e:?}").contains("PermissionDenied")
-                            && fd_kind.contains("dmabuf")
-                        {
-                            // The kernel refuses CPU mappings for VRAM-only
-                            // images (e.g. swapchain dma-bufs). These blobs
-                            // never had a host-side mapping on the normal
-                            // path; the descriptor re-registration above is
-                            // what the replay needs. Verified benign.
-                            eprintln!(
-                                "kumquat: blob {blob} (resource {resource_id}) not CPU-mappable ({fd_kind}) — descriptor re-registered, no host mapping needed",
-                                blob = exported.blob_id
-                            );
-                        } else {
-                            eprintln!(
-                                "kumquat: re-attach mapping failed for resource {resource_id} ctx {} blob {}: {e} fd={clone_fd} flags={clone_flags:#x} kind={fd_kind} fdinfo=[{fdinfo}]",
-                                exported.ctx_id, exported.blob_id,
-                            );
+            if exported.mapping.is_some() {
+                // The slot table already holds a mapping for this resource
+                // (address-stable across the slot's restores): only the
+                // registration is per-restore, the mapping itself is
+                // re-used.
+                let raw = exported.mapping.as_ref().unwrap().as_raw_mapping();
+                rutabaga_gfx::reattach_blob_mapping(
+                    exported.ctx_id,
+                    exported.blob_id as u32,
+                    raw.ptr as *mut c_void,
+                    RUTABAGA_MAP_CACHE_CACHED,
+                );
+                continue;
+            }
+            // First restore of this slot for the resource: map the
+            // client-visible memory and keep the mapping alive in the
+            // resource entry and the slot table for as long as the restored
+            // resource uses the address. The registration below is consumed
+            // by the restore replay, so every restore needs a fresh one.
+            let Ok(clone) = exported.descriptor.try_clone() else {
+                continue;
+            };
+            let clone_fd = clone.as_raw_descriptor();
+            let clone_flags = unsafe { libc::fcntl(clone_fd, libc::F_GETFL) };
+            // Capture identity NOW: from_safe_descriptor consumes (and on
+            // failure closes) the descriptor, so /proc reads must happen
+            // before the mmap attempt.
+            let fd_kind = std::fs::read_link(format!("/proc/self/fd/{clone_fd}"))
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|e| format!("readlink failed: {e}"));
+            let fdinfo = std::fs::read_to_string(format!("/proc/self/fd/{clone_fd}"))
+                .map(|s| s.lines().take(6).collect::<Vec<_>>().join("; "))
+                .unwrap_or_else(|e| format!("fdinfo failed: {e}"));
+            match MemoryMapping::from_safe_descriptor(
+                clone,
+                exported.size as usize,
+                RUTABAGA_MAP_CACHE_CACHED | RUTABAGA_MAP_ACCESS_RW,
+            ) {
+                Ok(mapping) => {
+                    let raw = mapping.as_raw_mapping();
+                    eprintln!(
+                        "kumquat: reattach resource {resource_id} ctx {} blob {} at {:#x} (fd {clone_fd} flags {clone_flags:#x})",
+                        exported.ctx_id, exported.blob_id, raw.ptr
+                    );
+                    let mapping = Arc::new(mapping);
+                    // Memoize the mapping in the slot table: later restores
+                    // of this slot re-use the same address, and the mapping
+                    // stays alive (never unmapped) while the table exists —
+                    // the concurrently running render thread reads the ring
+                    // through it until restoreAsg re-wires the ASG device.
+                    if let Some(table_resource) = state.resources.get_mut(resource_id) {
+                        if let Some(table_exported) = &mut table_resource.exported {
+                            table_exported.mapping = Some(mapping.clone());
                         }
-                        continue;
                     }
+                    exported.mapping = Some(mapping);
+                }
+                Err(e) => {
+                    // TODO: hack
+                    // mmap gives EPERM for PROT_WRITE on an O_RDONLY fd —
+                    // log the fd access mode so RO descriptors are visible.
+                    if format!("{e:?}").contains("PermissionDenied") && fd_kind.contains("dmabuf") {
+                        // The kernel refuses CPU mappings for VRAM-only
+                        // images (e.g. swapchain dma-bufs). These blobs
+                        // never had a host-side mapping on the normal
+                        // path; the descriptor re-registration above is
+                        // what the replay needs. Verified benign.
+                        eprintln!(
+                            "kumquat: blob {blob} (resource {resource_id}) not CPU-mappable ({fd_kind}) — descriptor re-registered, no host mapping needed",
+                            blob = exported.blob_id
+                        );
+                    } else {
+                        eprintln!(
+                            "kumquat: re-attach mapping failed for resource {resource_id} ctx {} blob {}: {e} fd={clone_fd} flags={clone_flags:#x} kind={fd_kind} fdinfo=[{fdinfo}]",
+                            exported.ctx_id, exported.blob_id,
+                        );
+                    }
+                    continue;
                 }
             }
-            // Re-register on every restore: the external object manager
-            // consumes the mapping on use, and the mapping itself stays alive
-            // in `exported`.
             let mapping = exported.mapping.as_ref().unwrap();
             let raw = mapping.as_raw_mapping();
             rutabaga_gfx::reattach_blob_mapping(

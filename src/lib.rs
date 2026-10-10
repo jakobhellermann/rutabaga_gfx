@@ -10,6 +10,8 @@ mod cross_domain;
 mod generated;
 mod gfxstream;
 #[cfg(feature = "gfxstream")]
+pub use gfxstream::clear_external_blob_objects;
+#[cfg(feature = "gfxstream")]
 pub use gfxstream::reattach_blob_descriptor;
 #[cfg(feature = "gfxstream")]
 pub use gfxstream::reattach_blob_mapping;
