@@ -15,6 +15,8 @@ pub use gfxstream::clear_external_blob_objects;
 pub use gfxstream::reattach_blob_descriptor;
 #[cfg(feature = "gfxstream")]
 pub use gfxstream::reattach_blob_mapping;
+#[cfg(feature = "gfxstream")]
+pub use gfxstream::reattach_ring_mapping;
 mod handle;
 mod magma;
 #[macro_use]

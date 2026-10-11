@@ -1041,11 +1041,13 @@ impl KumquatGpu {
                 // The slot table already holds a mapping for this resource
                 // (address-stable across the slot's restores): only the
                 // registration is per-restore, the mapping itself is
-                // re-used.
+                // re-used. Rings register under their resource id: the
+                // guest numbers its ring blobs per context (blob id 0 for
+                // every ASG context), so a (ctx, blob) key cannot tell two
+                // rings apart and one ring would pick up another's memory.
                 let raw = exported.mapping.as_ref().unwrap().as_raw_mapping();
-                rutabaga_gfx::reattach_blob_mapping(
-                    exported.ctx_id,
-                    exported.blob_id as u32,
+                rutabaga_gfx::reattach_ring_mapping(
+                    *resource_id,
                     raw.ptr as *mut c_void,
                     RUTABAGA_MAP_CACHE_CACHED,
                 );
@@ -1119,9 +1121,12 @@ impl KumquatGpu {
             }
             let mapping = exported.mapping.as_ref().unwrap();
             let raw = mapping.as_raw_mapping();
-            rutabaga_gfx::reattach_blob_mapping(
-                exported.ctx_id,
-                exported.blob_id as u32,
+            // Rings register under their resource id: the guest numbers its
+            // ring blobs per context (blob id 0 for every ASG context), so a
+            // (ctx, blob) key cannot tell two rings apart and one ring
+            // would pick up another's memory.
+            rutabaga_gfx::reattach_ring_mapping(
+                *resource_id,
                 raw.ptr as *mut c_void,
                 RUTABAGA_MAP_CACHE_CACHED,
             );

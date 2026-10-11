@@ -162,6 +162,21 @@ pub fn reattach_blob_mapping(ctx_id: u32, blob_id: u32, addr: *mut c_void, cachi
     unsafe { stream_renderer_reattach_blob_mapping(ctx_id, blob_id, addr, caching) };
 }
 
+/// Re-attaches a VMM-owned ring mapping keyed by the virtio-gpu resource id.
+/// The guest numbers its ring blobs per context (every ASG context claims
+/// blob id 0), so a (ctx, blob) key cannot tell two rings apart and the
+/// restore of one ring would pick up another ring's memory. The resource id
+/// is unique per ring; the caller keeps `addr` alive for as long as the
+/// restored resource uses it.
+// The raw pointer is handed straight to the C registration; gfxstream never
+// dereferences it on this path, so the missing `unsafe` marker is sound.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn reattach_ring_mapping(resource_id: u32, addr: *mut c_void, caching: u32) {
+    // SAFETY: addr is a valid caller-owned mapping; the C function only
+    // registers the pointer in the external object manager.
+    unsafe { stream_renderer_reattach_ring_mapping(resource_id, addr, caching) };
+}
+
 /// Re-registers a blob descriptor with gfxstream's external object manager so
 /// a replayed vkAllocateMemory during restore can import it again (the
 /// original descriptor is consumed by the first mapping). Takes ownership of
@@ -260,6 +275,11 @@ extern "C" {
     fn stream_renderer_reattach_blob_mapping(
         ctx_id: u32,
         blob_id: u32,
+        addr: *mut c_void,
+        caching: u32,
+    );
+    fn stream_renderer_reattach_ring_mapping(
+        resource_id: u32,
         addr: *mut c_void,
         caching: u32,
     );
