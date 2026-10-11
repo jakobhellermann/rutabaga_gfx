@@ -46,6 +46,15 @@
             ];
             buildInputs = [ backend ];
 
+            # The gfxstream host renderer creates its host Vulkan instance
+            # through the Vulkan loader, so a host Vulkan driver must be
+            # reachable with absolute paths. On NixOS that is the mesa from
+            # /run/opengl-driver; on other distros the nix glibc search paths
+            # do not include the host driver or its dependency closure, and
+            # exporting the distro library dir via LD_LIBRARY_PATH shadows
+            # nix libraries (soname collisions). This package therefore only
+            # works on NixOS hosts; elsewhere build kumquat with the host
+            # toolchain so it uses the host loader and driver.
             postInstall = ''
               wrapProgram $out/bin/kumquat \
                 --prefix LD_LIBRARY_PATH : ${
