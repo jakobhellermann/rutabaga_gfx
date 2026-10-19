@@ -81,6 +81,7 @@ fn create_signal_fd() -> std::result::Result<OwnedDescriptor, magma_gpu::util::E
 }
 
 fn main() -> KumquatGpuResult<()> {
+    line_buffer_c_stdout();
     let args = Args::parse();
 
     // gfxstream's Vulkan snapshot capture (VkReconstruction: handles, queues,
@@ -187,4 +188,16 @@ fn slot_directory(
              (legacy --snapshot-dir only serves slot 0)"
         ))),
     }
+}
+
+/// gfxstream logs info to C stdio's stdout, which is block-buffered when redirected to a
+/// file and lost when the host is killed.
+fn line_buffer_c_stdout() {
+    extern "C" {
+        static mut stdout: *mut libc::FILE;
+    }
+    // SAFETY: called first in main, so no other thread exists and nothing has operated on
+    // C stdout yet, which setvbuf requires; glibc initializes `stdout` before main.
+    let ret = unsafe { libc::setvbuf(stdout, std::ptr::null_mut(), libc::_IOLBF, 0) };
+    assert_eq!(ret, 0, "setvbuf(stdout, _IOLBF) failed");
 }
