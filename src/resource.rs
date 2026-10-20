@@ -72,6 +72,8 @@ pub(crate) struct RutabagaResourceSnapshot {
     pub(crate) vulkan_info: Option<VulkanInfo>,
     pub(crate) component_mask: u8,
     pub(crate) size: u64,
+    /// Whether the resource had an exportable handle; the restoring component exports it again.
+    pub(crate) has_handle: bool,
 }
 
 impl TryFrom<&RutabagaResource> for RutabagaResourceSnapshot {
@@ -91,6 +93,7 @@ impl TryFrom<&RutabagaResource> for RutabagaResourceSnapshot {
             vulkan_info: resource.vulkan_info,
             size: resource.size,
             component_mask: resource.component_mask,
+            has_handle: resource.handle.is_some(),
         })
     }
 }

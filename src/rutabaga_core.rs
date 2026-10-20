@@ -4,6 +4,7 @@
 
 //! rutabaga_core: Cross-platform, Rust-based, Wayland and Vulkan centric GPU virtualization.
 use std::collections::BTreeMap as Map;
+use std::collections::BTreeSet as Set;
 use std::convert::TryInto;
 use std::io::IoSlice;
 use std::io::IoSliceMut;
@@ -258,6 +259,11 @@ pub trait RutabagaComponent {
         Err(MagmaGpuError::Unsupported.into())
     }
 
+    /// Implementations must export the handle of a restored blob resource.
+    fn export_restored_blob(&self, _resource_id: u32) -> RutabagaResult<Arc<RutabagaHandle>> {
+        Err(MagmaGpuError::Unsupported.into())
+    }
+
     /// Implementations must restore the context from the given stream.
     fn restore_context(
         &self,
@@ -423,6 +429,8 @@ fn calculate_component(component_mask: u8) -> RutabagaResult<RutabagaComponentTy
 /// thread-safe is more difficult.
 pub struct Rutabaga {
     resources: Map<u32, RutabagaResource>,
+    /// Resources whose only handle export_blob gave away.
+    handed_out: Set<u32>,
     #[cfg(fence_passing_option1)]
     shareable_fences: Map<u64, MagmaGpuHandle>,
     contexts: Map<u32, Box<dyn RutabagaContext>>,
@@ -469,7 +477,11 @@ impl Rutabaga {
             resources: self
                 .resources
                 .iter()
-                .map(|(i, r)| Ok((*i, RutabagaResourceSnapshot::try_from(r)?)))
+                .map(|(i, r)| {
+                    let mut snapshot = RutabagaResourceSnapshot::try_from(r)?;
+                    snapshot.has_handle |= self.handed_out.contains(i);
+                    Ok((*i, snapshot))
+                })
                 .collect::<RutabagaResult<_>>()?,
             contexts: self
                 .contexts
@@ -531,8 +543,16 @@ impl Rutabaga {
         self.resources = snapshot
             .resources
             .into_iter()
-            .map(|(i, s)| Ok((i, RutabagaResource::try_from(s)?)))
+            .map(|(i, s)| {
+                let has_handle = s.has_handle;
+                let mut resource = RutabagaResource::try_from(s)?;
+                if has_handle {
+                    resource.handle = Some(component.export_restored_blob(i)?);
+                }
+                Ok((i, resource))
+            })
             .collect::<RutabagaResult<_>>()?;
+        self.handed_out.clear();
         self.contexts = snapshot
             .contexts
             .into_iter()
@@ -753,6 +773,7 @@ impl Rutabaga {
         self.resources
             .remove(&resource_id)
             .ok_or(RutabagaError::InvalidResourceId)?;
+        self.handed_out.remove(&resource_id);
 
         component.unref_resource(resource_id);
         Ok(())
@@ -1040,6 +1061,7 @@ impl Rutabaga {
             (Some(handle), false) => {
                 // Exactly one strong reference in this case.
                 let hnd = Arc::try_unwrap(handle).map_err(|_| MagmaGpuError::InvalidMagmaHandle)?;
+                self.handed_out.insert(resource_id);
                 Ok(hnd)
             }
             _ => Err(MagmaGpuError::InvalidMagmaHandle.into()),
@@ -1460,6 +1482,7 @@ impl RutabagaBuilder {
 
         Ok(Rutabaga {
             resources: Default::default(),
+            handed_out: Default::default(),
             #[cfg(fence_passing_option1)]
             shareable_fences: Default::default(),
             contexts: Default::default(),

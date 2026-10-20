@@ -602,6 +602,10 @@ impl Drop for Gfxstream {
 }
 
 impl RutabagaComponent for Gfxstream {
+    fn export_restored_blob(&self, resource_id: u32) -> RutabagaResult<Arc<RutabagaHandle>> {
+        self.export_blob(resource_id)
+    }
+
     fn get_capset_info(&self, capset_id: u32) -> (u32, u32) {
         let mut version = 0;
         let mut size = 0;
