@@ -107,6 +107,17 @@ pub struct KumquatGpu {
 }
 
 impl KumquatGpu {
+    pub fn snapshot(&mut self, directory: &Path) -> KumquatGpuResult<()> {
+        std::fs::create_dir_all(directory).map_err(MagmaGpuError::IoError)?;
+        self.rutabaga.snapshot(directory)?;
+        Ok(())
+    }
+
+    pub fn restore(&mut self, directory: &Path) -> KumquatGpuResult<()> {
+        self.rutabaga.restore(directory)?;
+        Ok(())
+    }
+
     pub fn new(capset_names: String, renderer_features: String) -> KumquatGpuResult<KumquatGpu> {
         let capset_mask = calculate_capset_mask(capset_names.as_str().split(":"));
         if capset_mask == 0 {

@@ -10,9 +10,12 @@ use log::error;
 use magma_gpu::util::AsBorrowedDescriptor;
 use magma_gpu::util::Error as MagmaGpuError;
 use magma_gpu::util::Listener;
+use magma_gpu::util::OwnedDescriptor;
 use magma_gpu::util::WaitContext;
 use magma_gpu::util::WaitTimeout;
 
+use crate::control::Control;
+use crate::control::ControlRequest;
 use crate::kumquat_gpu::KumquatGpu;
 use crate::kumquat_gpu::KumquatGpuConnection;
 use crate::kumquat_gpu::KumquatGpuResult;
@@ -20,7 +23,11 @@ use crate::kumquat_gpu::KumquatGpuResult;
 enum KumquatConnection {
     GpuListener,
     GpuConnection(Box<KumquatGpuConnection>),
+    Control(Control),
 }
+
+/// Client connection ids count up from the listener's 0 and never reach it.
+const CONTROL_CONNECTION_ID: u64 = u64::MAX;
 
 pub struct Kumquat {
     connection_id: u64,
@@ -31,7 +38,8 @@ pub struct Kumquat {
 }
 
 impl Kumquat {
-    pub fn run(&mut self) -> KumquatGpuResult<()> {
+    /// Serves one batch of events; `false` once the parent closed the control connection.
+    pub fn run(&mut self) -> KumquatGpuResult<bool> {
         let events = self.wait_ctx.wait(WaitTimeout::NoTimeout)?;
         for event in events {
             let mut hung_up = false;
@@ -75,6 +83,35 @@ impl Kumquat {
                                 o.remove_entry();
                             }
                         }
+                        KumquatConnection::Control(ref control) => {
+                            if !event.readable {
+                                return Ok(false);
+                            }
+                            let Some(request) = control.receive()? else {
+                                return Ok(false);
+                            };
+                            let kumquat_gpu =
+                                self.kumquat_gpu_opt
+                                    .as_mut()
+                                    .ok_or(MagmaGpuError::WithContext(
+                                        "control request without a GPU",
+                                    ))?;
+                            let result = match request {
+                                ControlRequest::Snapshot(directory) => {
+                                    kumquat_gpu.snapshot(&directory)
+                                }
+                                ControlRequest::Restore(directory) => {
+                                    kumquat_gpu.restore(&directory)
+                                }
+                            };
+                            match result {
+                                Ok(()) => control.send_ok()?,
+                                Err(e) => {
+                                    error!("control request failed: {e}");
+                                    control.send_err(&e.to_string())?;
+                                }
+                            }
+                        }
                     }
                 }
                 Entry::Vacant(_) => {
@@ -83,7 +120,7 @@ impl Kumquat {
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -91,6 +128,7 @@ pub struct KumquatBuilder {
     capset_names_opt: Option<String>,
     gpu_socket_opt: Option<String>,
     renderer_features_opt: Option<String>,
+    control_opt: Option<OwnedDescriptor>,
 }
 
 impl KumquatBuilder {
@@ -99,6 +137,7 @@ impl KumquatBuilder {
             capset_names_opt: None,
             gpu_socket_opt: None,
             renderer_features_opt: None,
+            control_opt: None,
         }
     }
 
@@ -117,6 +156,12 @@ impl KumquatBuilder {
         self
     }
 
+    pub fn set_control(mut self, control_opt: Option<OwnedDescriptor>) -> KumquatBuilder {
+        self.control_opt = control_opt;
+        self
+    }
+
+    /// With a control connection, reports ready on it once the GPU socket is bound.
     pub fn build(self) -> KumquatGpuResult<Kumquat> {
         let connection_id: u64 = 0;
         let mut wait_ctx = WaitContext::new()?;
@@ -140,6 +185,13 @@ impl KumquatBuilder {
             wait_ctx.add(connection_id, gpu_listener.as_borrowed_descriptor())?;
             connections.insert(connection_id, KumquatConnection::GpuListener);
             gpu_listener_opt = Some(gpu_listener);
+        }
+
+        if let Some(socket) = self.control_opt {
+            let control = Control::new(socket)?;
+            wait_ctx.add(CONTROL_CONNECTION_ID, control.as_borrowed_descriptor())?;
+            control.send_ready()?;
+            connections.insert(CONTROL_CONNECTION_ID, KumquatConnection::Control(control));
         }
 
         Ok(Kumquat {
