@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+mod control;
 mod kumquat;
 mod kumquat_gpu;
 
@@ -13,6 +14,22 @@ use magma_gpu::util::OwnedDescriptor;
 use magma_gpu::util::WritePipe;
 
 use crate::kumquat_gpu::KumquatGpuResult;
+
+struct StderrLogger;
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("kumquat: {}: {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
 
 #[derive(Parser, Debug)]
 #[command(version = "1.71", about = None, long_about = None)]
@@ -33,15 +50,25 @@ struct Args {
     /// An OS-specific pipe descriptor to the parent process
     #[arg(long, default_value = "0")]
     pipe_descriptor: i64,
+
+    /// A SOCK_SEQPACKET socket descriptor for snapshot/restore commands from the parent process
+    #[arg(long)]
+    control_fd: Option<i32>,
 }
 
 fn main() -> KumquatGpuResult<()> {
+    log::set_logger(&StderrLogger).expect("no other logger is installed");
+    log::set_max_level(log::LevelFilter::Info);
     let args = Args::parse();
 
     let mut kumquat = KumquatBuilder::new()
         .set_capset_names(args.capset_names)
         .set_gpu_socket((!args.gpu_socket_path.is_empty()).then_some(args.gpu_socket_path))
         .set_renderer_features(args.renderer_features)
+        .set_control(args.control_fd.map(|fd| {
+            // SAFETY: the parent passed a descriptor it opened and handed over.
+            unsafe { OwnedDescriptor::from_raw_descriptor(fd) }
+        }))
         .build()?;
 
     if args.pipe_descriptor != 0 {
@@ -53,7 +80,6 @@ fn main() -> KumquatGpuResult<()> {
         write_pipe.write(&1u64.to_le_bytes())?;
     }
 
-    loop {
-        kumquat.run()?;
-    }
+    while kumquat.run()? {}
+    Ok(())
 }
