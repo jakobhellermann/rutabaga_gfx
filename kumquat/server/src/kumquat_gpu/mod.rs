@@ -5,6 +5,7 @@
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap as Map;
 use std::collections::BTreeSet as Set;
+use std::ffi::CStr;
 use std::io::BufReader;
 use std::io::BufWriter;
 use std::io::Write;
@@ -32,6 +33,8 @@ use rutabaga_gfx::ResourceCreate3D;
 use rutabaga_gfx::ResourceCreateBlob;
 use rutabaga_gfx::Rutabaga;
 use rutabaga_gfx::RutabagaBuilder;
+use rutabaga_gfx::RutabagaDebug;
+use rutabaga_gfx::RutabagaDebugHandler;
 use rutabaga_gfx::RutabagaError;
 use rutabaga_gfx::RutabagaFence;
 use rutabaga_gfx::RutabagaFenceHandler;
@@ -39,6 +42,9 @@ use rutabaga_gfx::RutabagaIovec;
 use rutabaga_gfx::RutabagaWsi;
 use rutabaga_gfx::Transfer3D;
 use rutabaga_gfx::VulkanInfo as RutabagaVulkanInfo;
+use rutabaga_gfx::RUTABAGA_DEBUG_ERROR;
+use rutabaga_gfx::RUTABAGA_DEBUG_INFO;
+use rutabaga_gfx::RUTABAGA_DEBUG_WARNING;
 use rutabaga_gfx::RUTABAGA_FLAG_FENCE;
 use rutabaga_gfx::RUTABAGA_FLAG_FENCE_HOST_SHAREABLE;
 use rutabaga_gfx::RUTABAGA_MAP_ACCESS_RW;
@@ -136,6 +142,20 @@ pub fn create_fence_handler(fence_state: FenceState) -> RutabagaFenceHandler {
                 // entry
             }
         }
+    })
+}
+
+fn create_debug_handler() -> RutabagaDebugHandler {
+    RutabagaDebugHandler::new(|debug: RutabagaDebug| {
+        // SAFETY: the renderer passes a valid C string that lives for the call.
+        let message = unsafe { CStr::from_ptr(debug.message) }.to_string_lossy();
+        let level = match debug.debug_type {
+            RUTABAGA_DEBUG_ERROR => log::Level::Error,
+            RUTABAGA_DEBUG_WARNING => log::Level::Warn,
+            RUTABAGA_DEBUG_INFO => log::Level::Info,
+            _ => log::Level::Debug,
+        };
+        log::log!(level, "{message}");
     })
 }
 
@@ -265,6 +285,7 @@ impl KumquatGpu {
             .set_use_egl(true)
             .set_wsi(RutabagaWsi::Surfaceless)
             .set_renderer_features(renderer_features_opt)
+            .set_debug_handler(Some(create_debug_handler()))
             .build()?;
 
         Ok(KumquatGpu {
