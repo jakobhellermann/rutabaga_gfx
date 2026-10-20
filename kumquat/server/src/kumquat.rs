@@ -6,12 +6,16 @@ use std::collections::btree_map::Entry;
 use std::collections::BTreeMap as Map;
 use std::path::PathBuf;
 
+use log::error;
 use magma_gpu::util::AsBorrowedDescriptor;
 use magma_gpu::util::Error as MagmaGpuError;
 use magma_gpu::util::Listener;
+use magma_gpu::util::OwnedDescriptor;
 use magma_gpu::util::WaitContext;
 use magma_gpu::util::WaitTimeout;
 
+use crate::control::Control;
+use crate::control::ControlRequest;
 use crate::kumquat_gpu::KumquatGpu;
 use crate::kumquat_gpu::KumquatGpuConnection;
 use crate::kumquat_gpu::KumquatGpuResult;
@@ -19,7 +23,11 @@ use crate::kumquat_gpu::KumquatGpuResult;
 enum KumquatConnection {
     GpuListener,
     GpuConnection(Box<KumquatGpuConnection>),
+    Control(Control),
 }
+
+/// Client connection ids count up from the listener's 0 and never reach it.
+const CONTROL_CONNECTION_ID: u64 = u64::MAX;
 
 pub struct Kumquat {
     connection_id: u64,
@@ -30,7 +38,8 @@ pub struct Kumquat {
 }
 
 impl Kumquat {
-    pub fn run(&mut self) -> KumquatGpuResult<()> {
+    /// Serves one batch of events; `false` once the parent closed the control connection.
+    pub fn run(&mut self) -> KumquatGpuResult<bool> {
         let events = self.wait_ctx.wait(WaitTimeout::NoTimeout)?;
         for event in events {
             let mut hung_up = false;
@@ -56,14 +65,79 @@ impl Kumquat {
                         KumquatConnection::GpuConnection(ref mut gpu_conn) => {
                             if event.readable {
                                 if let Some(ref mut kumquat_gpu) = self.kumquat_gpu_opt {
-                                    hung_up =
-                                        !gpu_conn.process_command(kumquat_gpu)? && event.hung_up;
+                                    hung_up = match gpu_conn.process_command(kumquat_gpu) {
+                                        Ok(processed) => !processed && event.hung_up,
+                                        Err(e) => {
+                                            error!(
+                                                "closing connection {}: {e}",
+                                                event.connection_id
+                                            );
+                                            true
+                                        }
+                                    };
                                 }
                             }
 
                             if hung_up {
                                 self.wait_ctx.delete(gpu_conn.as_borrowed_descriptor())?;
                                 o.remove_entry();
+                            }
+                        }
+                        KumquatConnection::Control(ref control) => {
+                            if !event.readable {
+                                return Ok(false);
+                            }
+                            let Some(request) = control.receive()? else {
+                                return Ok(false);
+                            };
+                            let kumquat_gpu =
+                                self.kumquat_gpu_opt
+                                    .as_mut()
+                                    .ok_or(MagmaGpuError::WithContext(
+                                        "control request without a GPU",
+                                    ))?;
+                            match request {
+                                ControlRequest::List => {
+                                    control.send_ok()?;
+                                    for (resource_id, identity) in kumquat_gpu.exported_resources()
+                                    {
+                                        control.send_resource(resource_id, identity)?;
+                                    }
+                                    control.send_end()?;
+                                }
+                                ControlRequest::Snapshot(directory) => {
+                                    match kumquat_gpu.snapshot(&directory) {
+                                        Ok(()) => control.send_ok()?,
+                                        Err(e) => {
+                                            error!("snapshot failed: {e}");
+                                            // A partial snapshot is unusable and may hold the space that ran out.
+                                            if let Err(remove) = std::fs::remove_dir_all(&directory)
+                                            {
+                                                error!(
+                                                    "removing the failed snapshot {}: {remove}",
+                                                    directory.display()
+                                                );
+                                            }
+                                            control.send_err(&e.to_string())?;
+                                        }
+                                    }
+                                }
+                                ControlRequest::Restore(directory) => {
+                                    match kumquat_gpu.restore(&directory) {
+                                        Ok(exports) => {
+                                            control.send_ok()?;
+                                            for (resource_id, handle) in exports {
+                                                control
+                                                    .send_remap(resource_id, handle.os_handle)?;
+                                            }
+                                            control.send_end()?;
+                                        }
+                                        Err(e) => {
+                                            error!("restore failed: {e}");
+                                            control.send_err(&e.to_string())?;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -74,7 +148,7 @@ impl Kumquat {
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -82,6 +156,7 @@ pub struct KumquatBuilder {
     capset_names_opt: Option<String>,
     gpu_socket_opt: Option<String>,
     renderer_features_opt: Option<String>,
+    control_opt: Option<OwnedDescriptor>,
 }
 
 impl KumquatBuilder {
@@ -90,6 +165,7 @@ impl KumquatBuilder {
             capset_names_opt: None,
             gpu_socket_opt: None,
             renderer_features_opt: None,
+            control_opt: None,
         }
     }
 
@@ -108,6 +184,12 @@ impl KumquatBuilder {
         self
     }
 
+    pub fn set_control(mut self, control_opt: Option<OwnedDescriptor>) -> KumquatBuilder {
+        self.control_opt = control_opt;
+        self
+    }
+
+    /// With a control connection, reports ready on it once the GPU socket is bound.
     pub fn build(self) -> KumquatGpuResult<Kumquat> {
         let connection_id: u64 = 0;
         let mut wait_ctx = WaitContext::new()?;
@@ -131,6 +213,13 @@ impl KumquatBuilder {
             wait_ctx.add(connection_id, gpu_listener.as_borrowed_descriptor())?;
             connections.insert(connection_id, KumquatConnection::GpuListener);
             gpu_listener_opt = Some(gpu_listener);
+        }
+
+        if let Some(socket) = self.control_opt {
+            let control = Control::new(socket)?;
+            wait_ctx.add(CONTROL_CONNECTION_ID, control.as_borrowed_descriptor())?;
+            control.send_ready()?;
+            connections.insert(CONTROL_CONNECTION_ID, KumquatConnection::Control(control));
         }
 
         Ok(Kumquat {
