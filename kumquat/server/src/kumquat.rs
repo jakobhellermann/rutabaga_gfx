@@ -96,19 +96,47 @@ impl Kumquat {
                                     .ok_or(MagmaGpuError::WithContext(
                                         "control request without a GPU",
                                     ))?;
-                            let result = match request {
+                            match request {
+                                ControlRequest::List => {
+                                    control.send_ok()?;
+                                    for (resource_id, identity) in kumquat_gpu.exported_resources()
+                                    {
+                                        control.send_resource(resource_id, identity)?;
+                                    }
+                                    control.send_end()?;
+                                }
                                 ControlRequest::Snapshot(directory) => {
-                                    kumquat_gpu.snapshot(&directory)
+                                    match kumquat_gpu.snapshot(&directory) {
+                                        Ok(()) => control.send_ok()?,
+                                        Err(e) => {
+                                            error!("snapshot failed: {e}");
+                                            // A partial snapshot is unusable and may hold the space that ran out.
+                                            if let Err(remove) = std::fs::remove_dir_all(&directory)
+                                            {
+                                                error!(
+                                                    "removing the failed snapshot {}: {remove}",
+                                                    directory.display()
+                                                );
+                                            }
+                                            control.send_err(&e.to_string())?;
+                                        }
+                                    }
                                 }
                                 ControlRequest::Restore(directory) => {
-                                    kumquat_gpu.restore(&directory)
-                                }
-                            };
-                            match result {
-                                Ok(()) => control.send_ok()?,
-                                Err(e) => {
-                                    error!("control request failed: {e}");
-                                    control.send_err(&e.to_string())?;
+                                    match kumquat_gpu.restore(&directory) {
+                                        Ok(exports) => {
+                                            control.send_ok()?;
+                                            for (resource_id, handle) in exports {
+                                                control
+                                                    .send_remap(resource_id, handle.os_handle)?;
+                                            }
+                                            control.send_end()?;
+                                        }
+                                        Err(e) => {
+                                            error!("restore failed: {e}");
+                                            control.send_err(&e.to_string())?;
+                                        }
+                                    }
                                 }
                             }
                         }

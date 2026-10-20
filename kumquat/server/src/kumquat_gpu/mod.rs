@@ -5,6 +5,9 @@
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap as Map;
 use std::collections::BTreeSet as Set;
+use std::io::BufReader;
+use std::io::BufWriter;
+use std::io::Write;
 use std::os::raw::c_void;
 use std::path::Path;
 use std::sync::Arc;
@@ -40,6 +43,8 @@ use rutabaga_gfx::RUTABAGA_FLAG_FENCE;
 use rutabaga_gfx::RUTABAGA_FLAG_FENCE_HOST_SHAREABLE;
 use rutabaga_gfx::RUTABAGA_MAP_ACCESS_RW;
 use rutabaga_gfx::RUTABAGA_MAP_CACHE_CACHED;
+use serde::Deserialize;
+use serde::Serialize;
 use thiserror::Error;
 
 const SNAPSHOT_DIR: &str = "/tmp/";
@@ -75,6 +80,41 @@ pub struct KumquatGpuConnection {
 pub struct KumquatGpuResource {
     attached_contexts: Set<u32>,
     mapping: Option<MemoryMapping>,
+    /// Identity of the blob memory handed to the client.
+    exported: Option<ObjectIdentity>,
+}
+
+/// Kernel identity of an object a client holds a descriptor of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+fn identity_of(descriptor: &OwnedDescriptor) -> KumquatGpuResult<ObjectIdentity> {
+    let stat = rustix::fs::fstat(descriptor).map_err(|e| MagmaGpuError::IoError(e.into()))?;
+    Ok(ObjectIdentity {
+        dev: stat.st_dev,
+        ino: stat.st_ino,
+    })
+}
+
+/// Name of kumquat's own state next to rutabaga's in a snapshot directory.
+const SNAPSHOT_FRAGMENT: &str = "kumquat.json";
+
+#[derive(Serialize, Deserialize)]
+struct KumquatGpuSnapshot {
+    id_allocator: u32,
+    resources: Map<u32, ResourceSnapshot>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ResourceSnapshot {
+    attached_contexts: Set<u32>,
+    /// Backed by kumquat's shared memory; the restore re-attaches the same memory.
+    backing: bool,
+    /// Blob memory handed to the client; the restore exports it anew.
+    exported: bool,
 }
 
 pub struct FenceData {
@@ -107,15 +147,96 @@ pub struct KumquatGpu {
 }
 
 impl KumquatGpu {
+    /// Blob resources whose memory a client holds, with that memory's identity.
+    pub fn exported_resources(&self) -> Vec<(u32, ObjectIdentity)> {
+        self.resources
+            .iter()
+            .filter_map(|(id, resource)| Some((*id, resource.exported?)))
+            .collect()
+    }
+
     pub fn snapshot(&mut self, directory: &Path) -> KumquatGpuResult<()> {
         std::fs::create_dir_all(directory).map_err(MagmaGpuError::IoError)?;
         self.rutabaga.snapshot(directory)?;
+
+        let snapshot = KumquatGpuSnapshot {
+            id_allocator: self.id_allocator,
+            resources: self
+                .resources
+                .iter()
+                .map(|(id, resource)| {
+                    (
+                        *id,
+                        ResourceSnapshot {
+                            attached_contexts: resource.attached_contexts.clone(),
+                            backing: resource.mapping.is_some(),
+                            exported: resource.exported.is_some(),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let file = std::fs::File::create(directory.join(SNAPSHOT_FRAGMENT))
+            .map_err(MagmaGpuError::IoError)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer(&mut writer, &snapshot)
+            .map_err(|e| MagmaGpuError::IoError(e.into()))?;
+        writer.flush().map_err(MagmaGpuError::IoError)?;
         Ok(())
     }
 
-    pub fn restore(&mut self, directory: &Path) -> KumquatGpuResult<()> {
+    /// Restores like a VMM resuming a VM: rutabaga recreates the resources, kumquat re-attaches
+    /// the shared memory it still holds and exports blob memory anew. Returns the new blob
+    /// handles, which clients must use in place of the ones they hold.
+    pub fn restore(&mut self, directory: &Path) -> KumquatGpuResult<Vec<(u32, MagmaGpuHandle)>> {
+        let file = std::fs::File::open(directory.join(SNAPSHOT_FRAGMENT))
+            .map_err(MagmaGpuError::IoError)?;
+        let snapshot: KumquatGpuSnapshot = serde_json::from_reader(BufReader::new(file))
+            .map_err(|e| MagmaGpuError::IoError(e.into()))?;
+
         self.rutabaga.restore(directory)?;
-        Ok(())
+
+        let mut previous = std::mem::take(&mut self.resources);
+        let mut exports = Vec::new();
+        for (resource_id, saved) in snapshot.resources {
+            let mapping = if saved.backing {
+                let mapping = previous
+                    .remove(&resource_id)
+                    .and_then(|resource| resource.mapping)
+                    .ok_or(MagmaGpuError::WithContext(
+                        "the shared memory of a restored resource is gone",
+                    ))?;
+                let raw = mapping.as_raw_mapping();
+                self.rutabaga.attach_backing(
+                    resource_id,
+                    vec![RutabagaIovec {
+                        base: raw.ptr as *mut c_void,
+                        len: raw.size as usize,
+                    }],
+                )?;
+                Some(mapping)
+            } else {
+                None
+            };
+            let exported = if saved.exported {
+                let handle = MagmaGpuHandle::try_from(self.rutabaga.export_blob(resource_id)?)?;
+                let identity = identity_of(&handle.os_handle)?;
+                exports.push((resource_id, handle));
+                Some(identity)
+            } else {
+                None
+            };
+            self.resources.insert(
+                resource_id,
+                KumquatGpuResource {
+                    attached_contexts: saved.attached_contexts,
+                    mapping,
+                    exported,
+                },
+            );
+        }
+        self.id_allocator = snapshot.id_allocator;
+        Ok(exports)
     }
 
     pub fn new(capset_names: String, renderer_features: String) -> KumquatGpuResult<KumquatGpu> {
@@ -306,6 +427,7 @@ impl KumquatGpuConnection {
                         KumquatGpuResource {
                             attached_contexts: Default::default(),
                             mapping: Some(mapping),
+                            exported: None,
                         },
                     );
 
@@ -462,6 +584,7 @@ impl KumquatGpuConnection {
                         KumquatGpuResource {
                             attached_contexts: Set::from([cmd.ctx_id]),
                             mapping: None,
+                            exported: Some(identity_of(&handle.os_handle)?),
                         },
                     );
 
