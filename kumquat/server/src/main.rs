@@ -14,6 +14,22 @@ use magma_gpu::util::WritePipe;
 
 use crate::kumquat_gpu::KumquatGpuResult;
 
+struct StderrLogger;
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("kumquat: {}: {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
 #[derive(Parser, Debug)]
 #[command(version = "1.71", about = None, long_about = None)]
 struct Args {
@@ -36,6 +52,8 @@ struct Args {
 }
 
 fn main() -> KumquatGpuResult<()> {
+    log::set_logger(&StderrLogger).expect("no other logger is installed");
+    log::set_max_level(log::LevelFilter::Info);
     let args = Args::parse();
 
     let mut kumquat = KumquatBuilder::new()
