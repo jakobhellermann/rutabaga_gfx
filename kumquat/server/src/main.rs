@@ -6,6 +6,10 @@ mod control;
 mod kumquat;
 mod kumquat_gpu;
 
+use std::io::Write;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
 use clap::Parser;
 use kumquat::KumquatBuilder;
 use magma_gpu::util::FromRawDescriptor;
@@ -17,14 +21,31 @@ use crate::kumquat_gpu::KumquatGpuResult;
 
 struct StderrLogger;
 
+/// Log lines stderr refused, e.g. on a full disk; a panic would take the renderer down with them.
+static DROPPED_LINES: AtomicU64 = AtomicU64::new(0);
+
 impl log::Log for StderrLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
         metadata.level() <= log::max_level()
     }
 
     fn log(&self, record: &log::Record) {
-        if self.enabled(record.metadata()) {
-            eprintln!("kumquat: {}: {}", record.level(), record.args());
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let mut stderr = std::io::stderr().lock();
+        let dropped = DROPPED_LINES.load(Ordering::Relaxed);
+        if dropped > 0
+            && writeln!(
+                stderr,
+                "kumquat: ERROR: {dropped} log lines lost to failed writes"
+            )
+            .is_ok()
+        {
+            DROPPED_LINES.fetch_sub(dropped, Ordering::Relaxed);
+        }
+        if writeln!(stderr, "kumquat: {}: {}", record.level(), record.args()).is_err() {
+            DROPPED_LINES.fetch_add(1, Ordering::Relaxed);
         }
     }
 
